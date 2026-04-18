@@ -1,0 +1,8 @@
+document_store:
+  path: backend/data/processed/chunks.db   # gitignored
+
+vector_db:
+  path: backend/data/processed/faiss.index  # populated in Stage 4
+
+graph_db:
+  path: backend/data/processed/graph.json   # gitignored

@@ -1,0 +1,102 @@
+whisper:
+  model_size: small        # tiny | base | small | medium | large
+  device: cpu
+  compute_type: int8       # int8 is fastest on CPU
+
+captioning:
+  provider: anthropic         # ollama | anthropic
+
+  # Ollama settings (active when provider: ollama)
+  ollama_model: llava:13b
+  ollama_base_url: http://localhost:11434
+
+  # Anthropic settings (active when provider: anthropic)
+  # Reads ANTHROPIC_API_KEY from environment automatically
+  anthropic_model: claude-haiku-4-5-20251001
+
+  max_tokens: 150
+
+keyframe:
+  ssim_threshold: 0.85     # lower = more sensitive to visual changes
+  sample_fps: 1            # frames per second to sample (1 = one frame/sec)
+
+slide_processor:
+  image_dpi: 150           # render resolution for PDF pages (higher = sharper, larger files)
+
+pdf_processor:
+  max_chunk_chars: 2000    # split sections larger than this at paragraph boundaries
+  min_heading_size: 14     # font pt size at or above which a line is treated as a heading
+
+vector_retriever:
+  model: all-MiniLM-L6-v2    # sentence-transformers model (cached after first download)
+  top_k: 5
+
+graph_retriever:
+  max_hops: 3                 # hard BFS depth cap
+  relevance_threshold: 0.4   # cosine similarity cutoff for neighbour expansion
+  max_nodes_per_hop: 10       # max neighbours to expand per BFS level
+  top_k_anchors: 3            # number of anchor nodes to seed BFS from
+
+query_router:
+  use_llm_fallback: true        # false = heuristics only (faster, less accurate)
+  llm_provider: anthropic          # ollama | anthropic
+  llm_ollama_model: llama3.2:3b
+  llm_ollama_base_url: http://localhost:11434
+  llm_anthropic_model: claude-haiku-4-5-20251001
+  llm_max_tokens: 50
+
+generator:
+  provider: anthropic             # ollama | anthropic
+  ollama_model: llama3.2:3b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 1024
+  max_context_chars: 4000     # chars of retrieved context fed into the generation prompt
+
+multi_hop_reasoner:
+  provider: anthropic             # ollama | anthropic
+  ollama_model: llama3.2:3b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 256
+  max_sub_questions: 4        # max number of sub-questions to decompose into
+
+self_rag:
+  provider: anthropic             # ollama | anthropic
+  ollama_model: llama3.2:3b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 256
+  max_context_chars: 4000      # chars of retrieved context fed to the reflector (must match generator)
+
+entity_extractor:
+  ner_backend: gliner              # gliner | spacy
+
+  # GLiNER settings (used when ner_backend: gliner)
+  gliner_model: urchade/gliner_medium-v2.1
+  gliner_labels:
+    - concept
+    - process
+    - theory
+    - law
+    - principle
+    - entity
+    - algorithm
+    - model
+    - technique
+    - method
+    - task
+    - framework
+    - architecture
+  gliner_threshold: 0.3
+
+  # spaCy settings (used when ner_backend: spacy)
+  # Requires: python -m spacy download en_core_web_sm
+  spacy_model: en_core_web_sm
+
+  # Relation extraction LLM (separate from captioning — use a small fast model)
+  relation_provider: anthropic        # ollama | anthropic
+  relation_ollama_model: llama3.2:3b
+  relation_ollama_base_url: http://localhost:11434
+  relation_anthropic_model: claude-haiku-4-5-20251001
+  relation_max_tokens: 512
