@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      # Persist the SQLite DB, FAISS index, and graph across restarts
+      - luminrag_data:/app/backend/data/processed
+      # Mount config so you can tweak LLM settings without rebuilding
+      - ./config:/app/config
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  luminrag_data:

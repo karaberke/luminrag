@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+/* ── Graph node animations ─────────────────────────────────────────────────── */
+
+/* Expanding ring that pulses outward from a highlighted node */
+.node-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: nodeRingExpand 2.2s ease-out infinite;
+  pointer-events: none;
+}
+
+/* Gentle brightness pulse on the node fill */
+.node-pulse {
+  animation: nodeFillPulse 2.5s ease-in-out infinite;
+}
+
+@keyframes nodeRingExpand {
+  0%   { transform: scale(1);    opacity: 0.55; }
+  70%  { transform: scale(1.9);  opacity: 0;    }
+  100% { transform: scale(1.9);  opacity: 0;    }
+}
+
+@keyframes nodeFillPulse {
+  0%, 100% { opacity: 1;    }
+  50%       { opacity: 0.72; }
+}

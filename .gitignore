@@ -1,0 +1,106 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.venv.bak/
+
+# Dependency / build files
+.pycache/
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test / coverage
+.tox/
+.coverage
+.cache
+.coverage.*
+.coverage.*.json
+.pytest_cache/
+.hypothesis/
+.nyc_output/
+
+# --- Local config / credentials ---
+.env
+.env.local
+.env.*.local
+.env.local.example
+.env.staging
+.env.production
+settings.local.json
+
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.sublime-project
+*.sublime-workspace
+
+# OS / editor temp files
+.DS_Store
+Thumbs.db
+*.DS_Store?
+ehthumbs_vista.db
+ehthumbs.db
+Desktop.ini
+
+# --- Node / React frontend ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.yarn/
+.pnpm-store/
+
+# Build output
+frontend/dist/
+frontend/build/
+frontend/out/
+
+# Local dev server
+frontend/.vite
+frontend/.vite-inspect
+
+# --- Databases / local data ---
+backend/db.sqlite3
+backend/*.db
+backend/data/*
+
+# --- Logs / misc ---
+*.log
+*.tmp
+*.bak
+*.bk
+.DS_Store*
+*.local
+CLAUDE.md
+
+# --- Optional: large binary / cache ---
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+*.tar.gz
+
+# --- Optional: git hooks / sensitive ---
+.hooks/
+/hooks/
+.webpack/
+
+backend/data/*

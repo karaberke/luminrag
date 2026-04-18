@@ -1,0 +1,41 @@
+# Core
+pydantic>=2.0
+pyyaml>=6.0
+numpy>=1.24
+
+# Video transcription
+faster-whisper>=1.0
+
+# Keyframe extraction
+opencv-python>=4.8
+scikit-image>=0.21
+
+# Image handling
+Pillow>=10.0
+
+# PDF processing (slide_processor)
+pymupdf>=1.24
+
+# Stage 4 - Retrieval
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+
+# Stage 2 - Graph construction
+networkx>=3.0
+gliner>=0.2            # zero-shot NER (CPU inference, no GPU required)
+spacy>=3.7             # alternative NER backend; run: python -m spacy download en_core_web_sm
+
+# HTTP (Ollama + Anthropic SDK dependency)
+httpx>=0.27
+
+# Captioning providers
+anthropic>=0.30        # used when captioning.provider = anthropic
+
+# Web API
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9    # required for FastAPI file upload / form parsing
+
+# Testing
+pytest>=8.0
+pytest-mock>=3.12
