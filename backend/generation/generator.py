@@ -19,7 +19,9 @@ from backend.self_rag.self_rag_reflector import reflect_answer
 from backend.generation.prompts import (
     DENSE_RAG_PROMPT,
     GRAPH_RAG_PROMPT,
+    HYBRID_RAG_PROMPT,
     NO_RETRIEVAL_PROMPT,
+    SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,11 +65,12 @@ def _format_relationships(result: RetrievalResult) -> str:
 # LLM callers
 # ---------------------------------------------------------------------------
 
-def _call_ollama(prompt: str, cfg: dict) -> str:
+def _call_ollama(prompt: str, system: str, cfg: dict) -> str:
     import httpx
 
     payload = {
         "model": cfg.get("ollama_model", "llama3.2:3b"),
+        "system": system,
         "prompt": prompt,
         "stream": False,
         "options": {"num_predict": cfg.get("max_tokens", 1024)},
@@ -78,25 +81,26 @@ def _call_ollama(prompt: str, cfg: dict) -> str:
     return response.json()["response"]
 
 
-def _call_anthropic(prompt: str, cfg: dict) -> str:
+def _call_anthropic(prompt: str, system: str, cfg: dict) -> str:
     import anthropic
 
     client = anthropic.Anthropic()
     message = client.messages.create(
         model=cfg.get("anthropic_model", "claude-haiku-4-5-20251001"),
         max_tokens=cfg.get("max_tokens", 1024),
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text
 
 
-def _call_llm(prompt: str, cfg: dict) -> str:
+def _call_llm(prompt: str, system: str, cfg: dict) -> str:
     """Dispatch to the configured LLM provider."""
     provider = cfg.get("provider", "ollama")
     if provider == "ollama":
-        return _call_ollama(prompt, cfg)
+        return _call_ollama(prompt, system, cfg)
     if provider == "anthropic":
-        return _call_anthropic(prompt, cfg)
+        return _call_anthropic(prompt, system, cfg)
     raise ValueError(f"Unknown generator provider: '{provider}'")
 
 
@@ -152,6 +156,14 @@ def _build_prompt(
             relationships=relationships,
         )
 
+    if mode == "hybrid":
+        relationships = _format_relationships(result)
+        return HYBRID_RAG_PROMPT.format(
+            question=question,
+            context=context,
+            relationships=relationships,
+        )
+
     # dense
     return DENSE_RAG_PROMPT.format(question=question, context=context)
 
@@ -189,7 +201,7 @@ def generate(
     prompt = _build_prompt(question, retrieval_result, max_chars)
 
     try:
-        answer = _call_llm(prompt, cfg)
+        answer = _call_llm(prompt, SYSTEM_PROMPT, cfg)
     except Exception as exc:
         logger.error(f"LLM generation failed: {exc}")
         answer = (

@@ -1,31 +1,29 @@
 import { useRef, useState, type KeyboardEvent } from 'react'
 import { useTheme } from '../ThemeContext'
 
-export type RoutingMode = 'auto' | 'dense' | 'graph'
+export type RoutingMode = 'auto' | 'dense' | 'graph' | 'hybrid'
 
 interface Props {
-  onSubmit: (query: string, routingMode: RoutingMode) => void
+  onSubmit: (query: string, routingMode: RoutingMode, maxSources?: number, minRelevancy?: number) => void
   loading: boolean
   onFirstKeystroke?: () => void
+  suggestions?: string[]
 }
 
-const suggestions = [
-  'What is Retrieval-Augmented Generation (RAG)?',
-  'What is Stoquastic Hamiltonian?',
-  'What is a adiabatic evolution ',
-  'What is a quantum K-SAT problem?',
-]
-
 const MODES: { value: RoutingMode; label: string; title: string }[] = [
-  { value: 'auto',  label: 'Auto',  title: 'Let the system decide (heuristic + LLM router)' },
-  { value: 'dense', label: 'Dense', title: 'Force vector/dense retrieval' },
-  { value: 'graph', label: 'Graph', title: 'Force knowledge-graph retrieval' },
+  { value: 'auto',   label: 'Auto',   title: 'Let the system decide (heuristic + LLM router)' },
+  { value: 'dense',  label: 'Dense',  title: 'Force vector/dense retrieval' },
+  { value: 'graph',  label: 'Graph',  title: 'Force knowledge-graph retrieval' },
+  { value: 'hybrid', label: 'Hybrid', title: 'Combine dense vector and knowledge-graph retrieval' },
 ]
 
-export default function QueryInput({ onSubmit, loading, onFirstKeystroke }: Props) {
+export default function QueryInput({ onSubmit, loading, onFirstKeystroke, suggestions = [] }: Props) {
   const [value, setValue] = useState('')
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [routingMode, setRoutingMode] = useState<RoutingMode>('auto')
+  const [showOptions, setShowOptions] = useState(false)
+  const [minRelevancy, setMinRelevancy] = useState(0)
+  const [maxSources, setMaxSources] = useState<number | undefined>(undefined)
   const wasEmptyRef = useRef(true)
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -33,7 +31,7 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke }: Prop
   const submit = () => {
     const trimmed = value.trim()
     if (!trimmed || loading) return
-    onSubmit(trimmed, routingMode)
+    onSubmit(trimmed, routingMode, maxSources, minRelevancy > 0 ? minRelevancy : undefined)
     setValue('')
     wasEmptyRef.current = true
     setShowSuggestions(false)
@@ -58,15 +56,18 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke }: Prop
 
   const modeActiveClass = (m: RoutingMode) => {
     if (routingMode !== m) return isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'
-    if (m === 'dense') return 'bg-teal-600 text-white'
-    if (m === 'graph') return 'bg-indigo-600 text-white'
+    if (m === 'dense')  return 'bg-teal-600 text-white'
+    if (m === 'graph')  return 'bg-indigo-600 text-white'
+    if (m === 'hybrid') return 'bg-violet-600 text-white'
     return isDark ? 'bg-slate-600 text-slate-100' : 'bg-slate-300 text-slate-800'
   }
+
+  const relevancyLabel = minRelevancy === 0 ? 'No filter' : `${Math.round(minRelevancy * 100)}%`
 
   return (
     <div className="relative">
       {/* Suggestions */}
-      {showSuggestions && !value && (
+      {showSuggestions && !value && suggestions.length > 0 && (
         <div className={`absolute bottom-full left-0 right-0 mb-2 border rounded-xl overflow-hidden shadow-xl z-10 ${
           isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'
         }`}>
@@ -86,20 +87,71 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke }: Prop
         </div>
       )}
 
+      {/* Options panel */}
+      {showOptions && (
+        <div className={`mb-2 px-3 py-2.5 rounded-xl border text-xs ${
+          isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200 shadow-sm'
+        }`}>
+          <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
+            {/* Min relevancy slider */}
+            <label className={`flex flex-col gap-1 min-w-[160px] ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+              <span className="flex justify-between">
+                <span>Min relevancy</span>
+                <span className={`font-medium tabular-nums ${minRelevancy > 0 ? (isDark ? 'text-indigo-400' : 'text-indigo-600') : ''}`}>
+                  {relevancyLabel}
+                </span>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={minRelevancy}
+                onChange={(e) => setMinRelevancy(parseFloat(e.target.value))}
+                className="w-full accent-indigo-500 cursor-pointer"
+              />
+            </label>
+
+            {/* Max sources number input */}
+            <label className={`flex flex-col gap-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+              <span>Max sources</span>
+              <input
+                type="number"
+                min={1}
+                max={50}
+                placeholder="No limit"
+                value={maxSources ?? ''}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setMaxSources(v === '' ? undefined : Math.max(1, parseInt(v, 10)))
+                }}
+                className={`w-24 px-2 py-0.5 rounded-lg border text-xs outline-none ${
+                  isDark
+                    ? 'bg-slate-900 border-slate-600 text-slate-200 placeholder-slate-600 focus:border-indigo-500'
+                    : 'bg-slate-50 border-slate-300 text-slate-800 placeholder-slate-400 focus:border-indigo-400'
+                }`}
+              />
+            </label>
+          </div>
+        </div>
+      )}
+
       <div className={`flex items-end gap-2 border rounded-xl px-3 py-2 transition-colors ${
         isDark
           ? 'bg-slate-800 border-slate-700 focus-within:border-indigo-500'
           : 'bg-white border-slate-300 focus-within:border-indigo-400 shadow-sm'
       }`}>
-        <button
-          onClick={() => setShowSuggestions((v) => !v)}
-          title="Show example questions"
-          className={`mb-1 transition-colors text-lg leading-none ${
-            isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-indigo-500'
-          }`}
-        >
-          ✦
-        </button>
+        {suggestions.length > 0 && (
+          <button
+            onClick={() => setShowSuggestions((v) => !v)}
+            title="Show example questions"
+            className={`mb-1 transition-colors text-lg leading-none ${
+              isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-indigo-500'
+            }`}
+          >
+            ✦
+          </button>
+        )}
 
         {/* Routing mode selector */}
         <div className={`mb-1 flex items-center rounded-lg border overflow-hidden shrink-0 self-end ${
@@ -116,6 +168,19 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke }: Prop
             </button>
           ))}
         </div>
+
+        {/* Options toggle */}
+        <button
+          onClick={() => setShowOptions((v) => !v)}
+          title="Source filtering options"
+          className={`mb-1 w-6 h-6 flex items-center justify-center rounded-lg text-xs transition-colors shrink-0 ${
+            showOptions || minRelevancy > 0 || maxSources !== undefined
+              ? (isDark ? 'bg-indigo-700 text-white' : 'bg-indigo-100 text-indigo-600')
+              : (isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600')
+          }`}
+        >
+          ⚙
+        </button>
 
         <textarea
           value={value}

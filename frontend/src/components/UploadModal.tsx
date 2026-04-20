@@ -4,7 +4,10 @@ import { useTheme } from '../ThemeContext'
 interface IngestResult {
   files_processed: number
   chunks_produced: number
-  triples_extracted: number
+  topics_added: number
+  subtopics_added: number
+  contents_added: number
+  related_edges_added: number
   graph_nodes: number
   graph_edges: number
   failed: string[]
@@ -15,19 +18,33 @@ interface UploadModalProps {
   onSuccess: () => void
 }
 
+interface IngestJobStatus {
+  job_id: string
+  status: 'queued' | 'running' | 'done' | 'failed'
+  progress_stage: string
+  result: IngestResult | null
+  error: string | null
+}
+
+type UploadStage = 'idle' | 'presigning' | 'uploading' | 'processing' | 'done' | 'error'
+
 const ACCEPTED = '.pdf,.mp4,.mkv,.mov,.avi,.mp3,.wav,.m4a,.ogg,.flac,.aac,.wma,.jpg,.jpeg,.png,.webp'
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
 
 export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
   const [files, setFiles] = useState<File[]>([])
   const [slideFiles, setSlideFiles] = useState<Set<string>>(new Set())
-  const [uploading, setUploading] = useState(false)
+  const [stage, setStage] = useState<UploadStage>('idle')
+  const [uploadProgress, setUploadProgress] = useState({ done: 0, total: 0 })
   const [result, setResult] = useState<IngestResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [progressStage, setProgressStage] = useState<string>('')
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+
+  const busy = stage !== 'idle' && stage !== 'done' && stage !== 'error'
 
   const addFiles = (list: FileList | null) => {
     if (!list) return
@@ -51,27 +68,103 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
   }
 
   const handleUpload = async () => {
-    if (!files.length || uploading) return
-    setUploading(true)
+    if (!files.length || busy) return
     setError(null)
 
-    const form = new FormData()
-    for (const f of files) form.append('files', f)
-    form.append('slides', Array.from(slideFiles).join(','))
-
     try {
-      const res = await fetch(`${API_BASE}/api/ingest`, { method: 'POST', body: form })
-      if (!res.ok) {
-        const text = await res.text()
-        throw new Error(`Server error ${res.status}: ${text}`)
+      // Step 1 — Get presigned PUT URLs from backend
+      setStage('presigning')
+      const presignRes = await fetch(`${API_BASE}/api/upload/presign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(
+          files.map((f) => ({
+            filename: f.name,
+            content_type: f.type || 'application/octet-stream',
+          }))
+        ),
+      })
+      if (!presignRes.ok) {
+        const text = await presignRes.text()
+        throw new Error(`Presign error ${presignRes.status}: ${text}`)
       }
-      const data: IngestResult = await res.json()
-      setResult(data)
+      const presigned: Array<{ key: string; url: string; filename: string }> = await presignRes.json()
+
+      // Step 2 — Upload each file directly to S3
+      setStage('uploading')
+      setUploadProgress({ done: 0, total: files.length })
+
+      for (let i = 0; i < presigned.length; i++) {
+        const { url } = presigned[i]
+        const file = files[i]
+        const s3Res = await fetch(url, {
+          method: 'PUT',
+          body: file,
+          headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        })
+        if (!s3Res.ok) {
+          const text = await s3Res.text()
+          throw new Error(`S3 upload failed for "${file.name}" (${s3Res.status}): ${text}`)
+        }
+        setUploadProgress({ done: i + 1, total: files.length })
+      }
+
+      // Step 3 — Kick off ingestion (returns job_id immediately, no timeout risk)
+      setStage('processing')
+      const ingestRes = await fetch(`${API_BASE}/api/ingest/from-s3`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keys: presigned.map((p) => p.key),
+          slides: Array.from(slideFiles),
+        }),
+      })
+      if (!ingestRes.ok) {
+        const text = await ingestRes.text()
+        throw new Error(`Ingest error ${ingestRes.status}: ${text}`)
+      }
+      const { job_id }: { job_id: string } = await ingestRes.json()
+
+      // Step 4 — Poll until done or failed
+      await new Promise<void>((resolve, reject) => {
+        const poll = async () => {
+          try {
+            const statusRes = await fetch(`${API_BASE}/api/ingest/jobs/${job_id}`)
+            if (!statusRes.ok) {
+              reject(new Error(`Status check failed: ${statusRes.status}`))
+              return
+            }
+            const job: IngestJobStatus = await statusRes.json()
+            setProgressStage(job.progress_stage)
+            if (job.status === 'done' && job.result) {
+              setResult(job.result)
+              resolve()
+            } else if (job.status === 'failed') {
+              reject(new Error(job.error ?? 'Ingestion failed'))
+            } else {
+              setTimeout(poll, 3000)
+            }
+          } catch (e) {
+            reject(e)
+          }
+        }
+        setTimeout(poll, 3000)
+      })
+
+      setStage('done')
       onSuccess()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setUploading(false)
+      setStage('error')
+    }
+  }
+
+  const stageLabel = (): string => {
+    switch (stage) {
+      case 'presigning': return 'Preparing upload…'
+      case 'uploading':  return `Uploading ${uploadProgress.done} of ${uploadProgress.total} file${uploadProgress.total !== 1 ? 's' : ''}…`
+      case 'processing': return progressStage || 'Queued…'
+      default:           return 'Upload & Ingest'
     }
   }
 
@@ -79,9 +172,11 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
     ? [
         ['Files processed', result.files_processed],
         ['Chunks produced', result.chunks_produced],
-        ['Triples extracted', result.triples_extracted],
-        ['Graph nodes', result.graph_nodes],
-        ['Graph edges', result.graph_edges],
+        ['Topics added',    result.topics_added],
+        ['Subtopics added', result.subtopics_added],
+        ['Contents added',  result.contents_added],
+        ['Graph nodes',     result.graph_nodes],
+        ['Graph edges',     result.graph_edges],
       ]
     : []
 
@@ -112,7 +207,7 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
 
         {/* Body */}
         <div className="px-5 py-4 space-y-4">
-          {result ? (
+          {stage === 'done' && result ? (
             /* ── Result view ── */
             <div className="space-y-3">
               <div className={`flex items-center gap-2 ${isDark ? 'text-green-400' : 'text-green-600'}`}>
@@ -216,7 +311,7 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
                 </ul>
               )}
 
-              {error && (
+              {(stage === 'error') && error && (
                 <p className={`text-xs rounded-lg px-3 py-2 border ${
                   isDark
                     ? 'text-red-400 bg-red-950/40 border-red-800'
@@ -233,7 +328,7 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
         <div className={`flex items-center justify-end gap-2 px-5 py-3 border-t ${
           isDark ? 'border-slate-800 bg-slate-950/40' : 'border-slate-100 bg-slate-50/60'
         }`}>
-          {result ? (
+          {stage === 'done' ? (
             <button
               onClick={onClose}
               className="text-sm bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-1.5 rounded-lg transition-colors"
@@ -252,13 +347,13 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
               </button>
               <button
                 onClick={handleUpload}
-                disabled={!files.length || uploading}
+                disabled={!files.length || busy}
                 className="text-sm bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-lg transition-colors flex items-center gap-2"
               >
-                {uploading ? (
+                {busy ? (
                   <>
                     <div className="w-3.5 h-3.5 border border-white/30 border-t-white rounded-full animate-spin" />
-                    Processing…
+                    {stageLabel()}
                   </>
                 ) : (
                   'Upload & Ingest'

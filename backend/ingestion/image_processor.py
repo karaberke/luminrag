@@ -11,7 +11,7 @@ Pipeline:
 Reuses the same `captioning` config section as slide_processor.py:
     captioning:
       provider: ollama   # or: anthropic
-      ollama_model: llava:13b
+      ollama_model: llama3.2-vision
       ...
 
 Public API:

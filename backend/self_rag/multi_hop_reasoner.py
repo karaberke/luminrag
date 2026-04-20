@@ -119,12 +119,15 @@ def _merge_results(results: list[RetrievalResult]) -> RetrievalResult:
     """
     Merge multiple RetrievalResults into one.
     Chunks are deduplicated by id; triples by (head, relation, tail).
-    Routing mode is 'graph' if any result used graph retrieval, else 'dense'.
+    Routing mode is 'hybrid' when both dense and graph evidence are present,
+    'graph' if only graph results, 'dense' otherwise.
     """
     seen_chunk_ids: set[str] = set()
     seen_triple_keys: set[tuple] = set()
+    seen_node_keys: set[str] = set()
     merged_chunks: list[Chunk] = []
     merged_triples: list[GraphTriple] = []
+    merged_node_keys: list[str] = []
 
     for r in results:
         for chunk in r.chunks:
@@ -136,13 +139,82 @@ def _merge_results(results: list[RetrievalResult]) -> RetrievalResult:
             if key not in seen_triple_keys:
                 seen_triple_keys.add(key)
                 merged_triples.append(triple)
+        for nkey in r.subgraph_node_keys:
+            if nkey not in seen_node_keys:
+                seen_node_keys.add(nkey)
+                merged_node_keys.append(nkey)
 
-    routing_mode = "graph" if any(r.routing_mode == "graph" for r in results) else "dense"
+    modes = {r.routing_mode for r in results}
+    if "hybrid" in modes or ("dense" in modes and "graph" in modes):
+        routing_mode = "hybrid"
+    elif "graph" in modes:
+        routing_mode = "graph"
+    else:
+        routing_mode = "dense"
 
     return RetrievalResult(
         chunks=merged_chunks,
         subgraph=merged_triples,
         routing_mode=routing_mode,
+        subgraph_node_keys=merged_node_keys,
+    )
+
+
+def _retrieve_hybrid(
+    sub_q: str,
+    vector_index,
+    graph_builder,
+    store,
+    embedder,
+    config: dict,
+) -> RetrievalResult:
+    """
+    Run dense and graph retrieval, tag each chunk with its retrieval_source
+    in metadata ('dense', 'graph', or 'both' when found by both), then merge.
+    """
+    dense_result = retrieve_dense(sub_q, vector_index, store, config)
+    graph_result = retrieve_graph(sub_q, graph_builder, store, embedder, config)
+
+    graph_ids = {c.id for c in graph_result.chunks}
+    dense_ids = {c.id for c in dense_result.chunks}
+
+    tagged_chunks: list[Chunk] = []
+    seen: set[str] = set()
+
+    for chunk in dense_result.chunks:
+        source = "both" if chunk.id in graph_ids else "dense"
+        tagged_chunks.append(
+            chunk.model_copy(update={"metadata": {**chunk.metadata, "retrieval_source": source}})
+        )
+        seen.add(chunk.id)
+
+    for chunk in graph_result.chunks:
+        if chunk.id not in seen:
+            tagged_chunks.append(
+                chunk.model_copy(update={"metadata": {**chunk.metadata, "retrieval_source": "graph"}})
+            )
+
+    # Merge subgraph data (triples + node keys) from both results
+    seen_triple_keys: set[tuple] = set()
+    seen_node_keys: set[str] = set()
+    merged_triples: list[GraphTriple] = []
+    merged_node_keys: list[str] = []
+
+    for triple in graph_result.subgraph:
+        key = (triple.head, triple.relation, triple.tail)
+        if key not in seen_triple_keys:
+            seen_triple_keys.add(key)
+            merged_triples.append(triple)
+    for nkey in graph_result.subgraph_node_keys:
+        if nkey not in seen_node_keys:
+            seen_node_keys.add(nkey)
+            merged_node_keys.append(nkey)
+
+    return RetrievalResult(
+        chunks=tagged_chunks,
+        subgraph=merged_triples,
+        routing_mode="hybrid",
+        subgraph_node_keys=merged_node_keys,
     )
 
 
@@ -198,7 +270,9 @@ def reason(
             logger.debug(f"Sub-question routed to 'none', skipping: {sub_q!r}")
             continue
 
-        if mode == "graph":
+        if mode == "hybrid":
+            result = _retrieve_hybrid(sub_q, vector_index, graph_builder, store, embedder, config)
+        elif mode == "graph":
             result = retrieve_graph(sub_q, graph_builder, store, embedder, config)
         else:
             result = retrieve_dense(sub_q, vector_index, store, config)
@@ -216,6 +290,6 @@ def reason(
     if not results:
         logger.warning("No relevant results found across all sub-questions")
         fallback_mode = force_routing_mode or "dense"
-        return RetrievalResult(chunks=[], subgraph=[], routing_mode=fallback_mode)
+        return RetrievalResult(chunks=[], subgraph=[], routing_mode=fallback_mode, subgraph_node_keys=[])
 
     return _merge_results(results)
