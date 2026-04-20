@@ -44,10 +44,12 @@ Does augmenting a traditional dense RAG pipeline with a self-verifying, graph-ba
 Multimodal Sources → [Ingestion] → [Document Store + Vector Index + Concept Graph]
                                                     ↓
               Query → [Multi-hop Decomposer] → per sub-question:
-                                                    ├─ Query Router  →  "dense" | "graph" | "none"
+                                                    ├─ Query Router  →  "dense" | "graph" | "hybrid" | "none"
                                                     ├─ Dense Retrieval (FAISS)
-                                                    │   or Graph Retrieval (BFS over concept graph)
+                                                    │   and/or Graph Retrieval (BFS over concept graph)
                                                     └─ Self-RAG gate (reflect_retrieval)
+                                                    ↓
+                                          [Cross-encoder Reranker]  ← min_relevancy / max_sources
                                                     ↓
                                               [Generator + reflect_answer]
                                                     ↓
@@ -172,6 +174,14 @@ Routes each (sub-)question to the appropriate retrieval strategy using heuristic
 
 **Graph path** (`graph_retriever.py`): embed query → cosine-match anchor nodes → relevance-guided BFS (expand neighbour only if cosine similarity ≥ threshold) → collect subgraph triples + source chunks.
 
+**Hybrid path**: runs both dense and graph retrieval, then deduplicates by chunk ID before reranking.
+
+### Stage 4.5 — Cross-encoder reranking
+
+`reranker.py` re-scores all retrieved chunks with `cross-encoder/ms-marco-MiniLM-L-6-v2` (a cross-encoder that takes the full query–passage pair). Raw logits are mapped to (0, 1) via sigmoid. Two per-request knobs:
+- `min_relevancy` — drop chunks below this threshold (meaningful range 0.3–0.7)
+- `max_sources` — cap the number of chunks sent to the generator
+
 ### Stage 5 — Self-RAG reflection
 
 Two gates:
@@ -219,8 +229,19 @@ generator:
 |--------|------|-------------|
 | `GET` | `/api/health` | Liveness — reports index/graph/chunk-count status |
 | `GET` | `/api/graph` | Full concept graph as `{nodes, edges}` |
-| `POST` | `/api/query` | Run the QA pipeline; body: `{"query": "...", "routing_mode": "dense"\|"graph"\|null}` |
-| `POST` | `/api/ingest` | Upload files (multipart) and run the full ingestion pipeline in-process |
+| `POST` | `/api/query` | Run the QA pipeline; body: `{"query": "...", "routing_mode": "dense"\|"graph"\|"hybrid"\|null, "min_relevancy": 0.0, "max_sources": null}` |
+| `POST` | `/api/ingest` | Upload files (multipart); returns `202` with `job_id` immediately |
+| `POST` | `/api/ingest/from-s3` | Ingest files already uploaded to S3; returns `202` with `job_id` |
+| `GET` | `/api/ingest/jobs/{job_id}` | Poll async ingest job status |
+| `POST` | `/api/upload/presign` | Get pre-signed S3 URLs for direct browser upload |
+| `GET` | `/api/suggestions` | Dynamic query suggestions based on graph content |
+| `GET` | `/api/source/{source_id}` | Fetch raw source metadata for a chunk |
+| `GET` | `/api/graph/node/{node_id}` | Node detail + evidence chunks |
+| `POST` | `/api/graph/node` | Add a graph node manually |
+| `PATCH` | `/api/graph/node/{node_id}` | Edit node attributes |
+| `DELETE` | `/api/graph/node/{node_id}` | Remove a node |
+| `POST` | `/api/graph/edge` | Add an edge manually |
+| `DELETE` | `/api/graph/edge` | Remove an edge |
 | `DELETE` | `/api/data` | Wipe all stored data and reset in-memory state |
 
 Interactive docs at `/docs` when the backend is running.
