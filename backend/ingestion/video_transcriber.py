@@ -15,6 +15,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -33,19 +34,35 @@ logger = logging.getLogger(__name__)
 # Step 1: Audio extraction
 # ---------------------------------------------------------------------------
 
+_FFMPEG_UNSAFE_CHARS = frozenset("#?%&")
+
+
 def _extract_audio(video_path: Path, tmp_dir: str) -> Path:
     """Strip audio track to a 16 kHz mono WAV using ffmpeg."""
+    # ffmpeg's libavformat treats # (and other URL special chars) as URL
+    # fragment separators, causing [WinError 2] / "No such file" even when
+    # the file exists. Copy to a sanitised temp name to work around this.
+    ffmpeg_input = video_path
+    if _FFMPEG_UNSAFE_CHARS & set(video_path.name):
+        ffmpeg_input = Path(tmp_dir) / f"input{video_path.suffix}"
+        shutil.copy2(video_path, ffmpeg_input)
+
     audio_path = Path(tmp_dir) / "audio.wav"
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(video_path),
+        "-i", str(ffmpeg_input),
         "-vn",
         "-acodec", "pcm_s16le",
         "-ar", "16000",
         "-ac", "1",
         str(audio_path),
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffmpeg not found. Install ffmpeg and ensure it is on your PATH."
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"ffmpeg failed for {video_path}:\n{result.stderr.decode()}"

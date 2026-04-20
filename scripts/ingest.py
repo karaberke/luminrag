@@ -218,19 +218,94 @@ def main() -> None:
     index.save(index_path)
     logger.info(f"Vector index saved to {index_path}.")
 
-    # ── Stage 4: Build concept graph ─────────────────────────────────────────
-    from backend.graph.entity_extractor import extract_triples
+    # ── Stage 4: Build hierarchical concept graph ──────────────────────────
     from backend.graph.graph_builder import GraphBuilder
     from backend.graph.graph_export import export_graph
-    logger.info("\nExtracting concept triples…")
-    triples = extract_triples(all_chunks, config)
-    logger.info(f"{len(triples)} triple(s) extracted.")
+    from backend.graph.schema import ChunkLocator, ChunkRefAttrs, ProposalBundle
+    from backend.graph.topic_extractor import extract_topics
+    from backend.graph.subtopic_extractor import extract_subtopics
+    from backend.graph.content_synthesizer import synthesize_contents
+    from backend.graph.semantic_linker import link_nodes, build_linkables_from_graph
 
-    logger.info("Building concept graph…")
     builder = GraphBuilder(graph_path)
-    builder.add_triples(triples)
-    builder.save()
 
+    # Build a short preview for topic inference
+    preview_chars = 3000
+    preview = "Source files: " + ", ".join(p.name for p in files) + "\n\n"
+    preview += "\n\n".join(c.text for c in all_chunks if c.text.strip())
+    preview = preview[:preview_chars]
+
+    # Build ChunkRef nodes so Content → ChunkRef edges resolve
+    def _chunk_ref(c) -> ChunkRefAttrs:
+        meta = c.metadata or {}
+        src = Path(c.source_id).name if c.source_id else "source"
+        if c.modality in ("slide", "pdf") and (meta.get("page_number") or meta.get("page_start")):
+            name = f"Page {meta.get('page_number') or meta.get('page_start')} of {src}"
+        elif c.modality in ("video", "audio") and meta.get("start_time") is not None:
+            s = int(meta['start_time'])
+            name = f"{s // 60}:{s % 60:02d} in {src}"
+        else:
+            name = src
+        return ChunkRefAttrs(
+            chunk_id=c.id,
+            name=name,
+            modality=c.modality,
+            source_id=c.source_id,
+            locator=ChunkLocator(
+                page=meta.get("page_number") or meta.get("page_start"),
+                start_time=meta.get("start_time"),
+                end_time=meta.get("end_time"),
+            ),
+        )
+
+    logger.info("\nStage 1.2 — Topic inference …")
+    topic_proposals = extract_topics(
+        preview, [c.id for c in all_chunks], config,
+        existing_names=[], embedder=embedder,
+    )
+    topic_names = [tp.name for tp in topic_proposals]
+    logger.info(f"  {len(topic_proposals)} topic(s): {topic_names}")
+
+    logger.info("Stage 1.3 — Subtopic mapping …")
+    subtopic_proposals = extract_subtopics(
+        all_chunks, topic_names, config, existing_names=[], embedder=embedder,
+    )
+    logger.info(f"  {len(subtopic_proposals)} subtopic(s)")
+
+    subs_by_chunk: dict[str, list[str]] = {}
+    for sp in subtopic_proposals:
+        for cid in sp.source_chunk_ids:
+            subs_by_chunk.setdefault(cid, []).append(sp.name)
+
+    logger.info("Stage 1.4 — Content synthesis …")
+    content_proposals = []
+    for chunk in all_chunks:
+        content_proposals.extend(
+            synthesize_contents(
+                chunk, subs_by_chunk.get(chunk.id, []), topic_names,
+                config, existing_titles=[], embedder=embedder,
+            )
+        )
+    logger.info(f"  {len(content_proposals)} content unit(s)")
+
+    first_bundle = ProposalBundle(
+        chunk_refs=[_chunk_ref(c) for c in all_chunks],
+        topics=topic_proposals,
+        subtopics=subtopic_proposals,
+        contents=content_proposals,
+    )
+    apply_result = builder.apply_proposals(first_bundle)
+
+    logger.info("Stage 1.5 — Semantic linking …")
+    linkables = build_linkables_from_graph(builder.graph)
+    related_proposals = link_nodes(linkables, embedder, config)
+    logger.info(f"  {len(related_proposals)} RELATED_TO edge(s)")
+
+    if related_proposals:
+        related_result = builder.apply_proposals(ProposalBundle(related=related_proposals))
+        apply_result.related_edges_added += related_result.related_edges_added
+
+    builder.save()
     logger.info(f"Exporting graph to {export_path}…")
     export_graph(builder.graph, export_path)
 
@@ -238,16 +313,19 @@ def main() -> None:
     print("\n" + "=" * 50)
     print("Ingestion complete")
     print("=" * 50)
-    print(f"  Files processed : {len(files) - len(failed)}/{len(files)}")
+    print(f"  Files processed     : {len(files) - len(failed)}/{len(files)}")
     if failed:
-        print(f"  Failed files    : {', '.join(failed)}")
-    print(f"  Chunks produced : {len(all_chunks)}")
-    print(f"  Triples         : {len(triples)}")
-    print(f"  Graph nodes     : {builder.graph.number_of_nodes()}")
-    print(f"  Graph edges     : {builder.graph.number_of_edges()}")
-    print(f"  Document store  : {store_path}")
-    print(f"  Vector index    : {index_path}")
-    print(f"  Graph JSON      : {export_path}")
+        print(f"  Failed files        : {', '.join(failed)}")
+    print(f"  Chunks produced     : {len(all_chunks)}")
+    print(f"  Topics added        : {apply_result.topics_added}")
+    print(f"  Subtopics added     : {apply_result.subtopics_added}")
+    print(f"  Contents added      : {apply_result.contents_added}")
+    print(f"  RELATED_TO edges    : {apply_result.related_edges_added}")
+    print(f"  Graph nodes         : {builder.graph.number_of_nodes()}")
+    print(f"  Graph edges         : {builder.graph.number_of_edges()}")
+    print(f"  Document store      : {store_path}")
+    print(f"  Vector index        : {index_path}")
+    print(f"  Graph JSON          : {export_path}")
     print("=" * 50)
 
 

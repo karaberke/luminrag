@@ -36,6 +36,12 @@ fastapi>=0.111
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9    # required for FastAPI file upload / form parsing
 
+# Illustration rendering (equation → PNG via mathtext, no TeX install needed)
+matplotlib>=3.8
+
+# AWS S3 (presigned URL upload)
+boto3>=1.28
+
 # Testing
 pytest>=8.0
 pytest-mock>=3.12

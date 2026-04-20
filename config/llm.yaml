@@ -4,10 +4,11 @@ whisper:
   compute_type: int8       # int8 is fastest on CPU
 
 captioning:
-  provider: anthropic         # ollama | anthropic
-
-  # Ollama settings (active when provider: ollama)
-  ollama_model: llava:13b
+  provider: ollama         # ollama | anthropic
+  # Ollama vision model options (already pulled: qwen2.5vl:7b):
+  #   ollama pull qwen2.5vl:7b         (no dash — Ollama registry name)
+  #   ollama pull llama3.2-vision:11b
+  ollama_model: qwen2.5vl:7b
   ollama_base_url: http://localhost:11434
 
   # Anthropic settings (active when provider: anthropic)
@@ -31,45 +32,52 @@ vector_retriever:
   model: all-MiniLM-L6-v2    # sentence-transformers model (cached after first download)
   top_k: 5
 
+reranker:
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2  # ~22 MB, CPU-friendly cross-encoder
+
 graph_retriever:
   max_hops: 3                 # hard BFS depth cap
   relevance_threshold: 0.4   # cosine similarity cutoff for neighbour expansion
   max_nodes_per_hop: 10       # max neighbours to expand per BFS level
   top_k_anchors: 3            # number of anchor nodes to seed BFS from
+  key_term_boost: 0.15        # additive score bonus when a content node's key_term appears in the query
 
 query_router:
   use_llm_fallback: true        # false = heuristics only (faster, less accurate)
-  llm_provider: anthropic          # ollama | anthropic
-  llm_ollama_model: llama3.2:3b
+  llm_provider: ollama          # ollama | anthropic
+  llm_ollama_model: qwen2.5:7b
   llm_ollama_base_url: http://localhost:11434
   llm_anthropic_model: claude-haiku-4-5-20251001
   llm_max_tokens: 50
 
 generator:
-  provider: anthropic             # ollama | anthropic
-  ollama_model: llama3.2:3b
+  provider: ollama             # ollama | anthropic
+  ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
   anthropic_model: claude-haiku-4-5-20251001
   max_tokens: 1024
   max_context_chars: 4000     # chars of retrieved context fed into the generation prompt
 
 multi_hop_reasoner:
-  provider: anthropic             # ollama | anthropic
-  ollama_model: llama3.2:3b
+  provider: ollama             # ollama | anthropic
+  ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
   anthropic_model: claude-haiku-4-5-20251001
   max_tokens: 256
   max_sub_questions: 4        # max number of sub-questions to decompose into
 
 self_rag:
-  provider: anthropic             # ollama | anthropic
-  ollama_model: llama3.2:3b
+  provider: ollama             # ollama | anthropic
+  ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
   anthropic_model: claude-haiku-4-5-20251001
   max_tokens: 256
   max_context_chars: 4000      # chars of retrieved context fed to the reflector (must match generator)
 
 entity_extractor:
+  # Optional NER helper used by the Stage-1 extractors. Not required —
+  # topic/subtopic/content extractors are LLM-first and NER is currently
+  # reserved for future enhancement (seeding prompts with entity candidates).
   ner_backend: gliner              # gliner | spacy
 
   # GLiNER settings (used when ner_backend: gliner)
@@ -94,9 +102,55 @@ entity_extractor:
   # Requires: python -m spacy download en_core_web_sm
   spacy_model: en_core_web_sm
 
-  # Relation extraction LLM (separate from captioning — use a small fast model)
-  relation_provider: anthropic        # ollama | anthropic
-  relation_ollama_model: llama3.2:3b
-  relation_ollama_base_url: http://localhost:11434
-  relation_anthropic_model: claude-haiku-4-5-20251001
-  relation_max_tokens: 512
+# ----------------------------------------------------------------------
+# Stage-1 hierarchical graph extractors
+# ----------------------------------------------------------------------
+
+topic_extractor:
+  provider: ollama                # ollama | anthropic
+  ollama_model: qwen2.5:7b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 512
+  merge_threshold: 0.85              # cosine cutoff for synonym-swap with existing topic names
+
+subtopic_extractor:
+  provider: ollama
+  ollama_model: qwen2.5:7b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 512
+  merge_threshold: 0.82
+  max_workers: 4          # parallel LLM calls; set OLLAMA_NUM_PARALLEL to the same value
+
+content_synthesizer:
+  provider: ollama
+  ollama_model: qwen2.5:7b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 2000
+  merge_threshold: 0.88              # cosine cutoff for synonym-swap on content titles
+  # max_per_chunk: omitted → dynamic based on chunk length (3/5/7/10). Set an int to override.
+
+semantic_linker:
+  provider: ollama
+  ollama_model: qwen2.5:7b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 512
+  sim_lo: 0.55                       # related-but-not-duplicate lower bound
+  sim_hi: 0.90                       # upper bound (higher = suspected duplicate)
+  max_candidate_pairs: 80            # LLM budget cap per ingest
+  batch_size: 10                     # pairs per LLM call
+  min_confidence: 0.3                # drop edges below this confidence
+
+# ----------------------------------------------------------------------
+# Illustration worker — deterministic asset resolver for content nodes
+#   equations  → rendered to PNG via matplotlib.mathtext (no TeX install needed)
+#   diagram/image → sourced from images extracted during ingestion
+#   code / no match → illustration_path left null
+# ----------------------------------------------------------------------
+
+illustration_worker:
+  enabled: true
+  latex_dpi: 150            # DPI for equation PNG renders

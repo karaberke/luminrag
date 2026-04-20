@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 
 Modality = Literal["video", "slide", "pdf", "image", "audio"]
-RoutingMode = Literal["dense", "graph", "none"]
+RoutingMode = Literal["dense", "graph", "hybrid", "none"]
 
 
 class Chunk(BaseModel):
@@ -49,6 +49,10 @@ class RetrievalResult(BaseModel):
     chunks: list[Chunk]
     subgraph: list[GraphTriple]
     routing_mode: RoutingMode
+    # Graph-retriever-only: stable keys of every node in the retrieved subgraph.
+    # Empty for dense retrieval. Used by the API layer to build the `hops` list
+    # the frontend highlights in the concept graph.
+    subgraph_node_keys: list[str] = Field(default_factory=list)
 
 
 class ReflectionVerdict(BaseModel):

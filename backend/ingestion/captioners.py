@@ -2,7 +2,7 @@
 Shared captioner interface used by all ingestion modules.
 
 Providers:
-  - OllamaCaptioner  — local vision model via Ollama (e.g. llava:13b). Fully offline.
+  - OllamaCaptioner  — local vision model via Ollama (e.g. llama3.2-vision). Fully offline.
   - AnthropicCaptioner — Claude via the Anthropic API. Reads ANTHROPIC_API_KEY from env.
 
 Switch provider with one line in config/llm.yaml:
@@ -30,7 +30,7 @@ class BaseCaptioner(ABC):
 
 
 class OllamaCaptioner(BaseCaptioner):
-    """Calls a local Ollama vision model (e.g. llava:13b). Fully offline."""
+    """Calls a local Ollama vision model (e.g. llama3.2-vision). Fully offline."""
 
     def __init__(self, model: str, base_url: str, max_tokens: int) -> None:
         self.model = model

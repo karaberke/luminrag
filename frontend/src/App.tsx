@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
-import type { GraphData, GraphEdge, GraphNode, Message } from './types'
+import type { EvidenceChunk, GraphData, GraphEdge, GraphNode, Message } from './types'
 const GraphPanel = lazy(() => import('./components/GraphPanel'))
 import MessageBubble from './components/MessageBubble'
 import QueryInput, { type RoutingMode } from './components/QueryInput'
@@ -19,9 +19,13 @@ function generateId() {
 async function realQuery(
   query: string,
   routingMode: RoutingMode,
+  maxSources?: number,
+  minRelevancy?: number,
 ): Promise<Omit<Message, 'id' | 'timestamp'>> {
-  const body: Record<string, string> = { query }
+  const body: Record<string, string | number> = { query }
   if (routingMode !== 'auto') body.routing_mode = routingMode
+  if (maxSources !== undefined) body.max_sources = maxSources
+  if (minRelevancy !== undefined && minRelevancy > 0) body.min_relevancy = minRelevancy
   const res = await fetch(`${API_BASE}/api/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -38,17 +42,22 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [graph, setGraph] = useState<GraphData>(EMPTY_GRAPH)
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
+  const [selectedNodeEvidence, setSelectedNodeEvidence] = useState<EvidenceChunk[]>([])
+  const [selectedNodeLoading, setSelectedNodeLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [maximized, setMaximized] = useState(false)
+  const [fullscreen, setFullscreen] = useState(false)
   const [isGraphLoading, setIsGraphLoading] = useState(true)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [backendReady, setBackendReady] = useState(false)
   const [wakingUp, setWakingUp] = useState(false)
   const [editMode, setEditMode] = useState(false)
+  const [suggestions, setSuggestions] = useState<string[]>([])
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const baseGraphRef = useRef<GraphData>(EMPTY_GRAPH)
+  const nodeDetailRef = useRef<HTMLDivElement>(null)
   const { theme, toggleTheme } = useTheme()
   const isDark = theme === 'dark'
 
@@ -108,8 +117,20 @@ export default function App() {
       .finally(() => setIsGraphLoading(false))
   }
 
-  // Load the graph once the backend is confirmed ready
-  useEffect(() => { if (backendReady) loadGraph() }, [backendReady]) // eslint-disable-line react-hooks/exhaustive-deps
+  const loadSuggestions = () => {
+    fetch(`${API_BASE}/api/suggestions`)
+      .then((res) => (res.ok ? res.json() as Promise<string[]> : Promise.resolve([])))
+      .then(setSuggestions)
+      .catch(() => {})
+  }
+
+  // Load the graph and suggestions once the backend is confirmed ready
+  useEffect(() => {
+    if (backendReady) {
+      loadGraph()
+      loadSuggestions()
+    }
+  }, [backendReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -118,6 +139,25 @@ export default function App() {
   const handleNodeClick = (node: GraphNode) => {
     setSelectedNode((prev) => (prev?.id === node.id ? null : node))
   }
+
+  // Fetch the rich detail (including the evidence trail joined from SQLite)
+  // whenever the selected node changes.
+  useEffect(() => {
+    if (!selectedNode) {
+      setSelectedNodeEvidence([])
+      return
+    }
+    let cancelled = false
+    setSelectedNodeLoading(true)
+    fetch(`${API_BASE}/api/graph/node/${encodeURIComponent(selectedNode.id)}`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+      .then((data: { evidence?: EvidenceChunk[] }) => {
+        if (!cancelled) setSelectedNodeEvidence(data.evidence ?? [])
+      })
+      .catch(() => { if (!cancelled) setSelectedNodeEvidence([]) })
+      .finally(() => { if (!cancelled) setSelectedNodeLoading(false) })
+    return () => { cancelled = true }
+  }, [selectedNode])
 
   const handleFirstKeystroke = () => {
     setGraph((prev) => {
@@ -129,7 +169,7 @@ export default function App() {
     })
   }
 
-  const handleQuery = async (query: string, routingMode: RoutingMode = 'auto') => {
+  const handleQuery = async (query: string, routingMode: RoutingMode = 'auto', maxSources?: number, minRelevancy?: number) => {
     const userMsg: Message = {
       id: generateId(),
       role: 'user',
@@ -141,7 +181,7 @@ export default function App() {
     setGraph(baseGraphRef.current)
 
     try {
-      const result = await realQuery(query, routingMode)
+      const result = await realQuery(query, routingMode, maxSources, minRelevancy)
       const assistantMsg: Message = { id: generateId(), timestamp: new Date(), ...result }
       setMessages((prev) => [...prev, assistantMsg])
       if (result.hops && result.hops.length > 0) {
@@ -194,12 +234,23 @@ export default function App() {
   // Graph edit handlers
   // ---------------------------------------------------------------------------
 
-  const handleAddNode = async (name: string, nodeType: 'concept' | 'topic') => {
+  const handleAddNode = async (payload: {
+    name: string
+    node_type: 'topic' | 'subtopic' | 'content'
+    summary?: string
+    scope?: 'broad' | 'narrow'
+    content_type?: string
+    summary_beginner?: string
+    summary_intermediate?: string
+    summary_expert?: string
+    parent_topic_keys?: string[]
+    parent_subtopic_keys?: string[]
+  }) => {
     try {
       const res = await fetch(`${API_BASE}/api/graph/node`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, node_type: nodeType }),
+        body: JSON.stringify(payload),
       })
       if (!res.ok) {
         const text = await res.text()
@@ -227,12 +278,43 @@ export default function App() {
     }
   }
 
-  const handleConnectNodes = async (sourceId: string, targetId: string, relation: string) => {
+  const handleUpdateNode = async (nodeId: string, updates: Record<string, unknown>) => {
     try {
+      const res = await fetch(`${API_BASE}/api/graph/node/${encodeURIComponent(nodeId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        alert(`Update node failed: ${text}`)
+        return
+      }
+      loadGraph()
+    } catch (e) {
+      alert(`Update node failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  const handleConnectNodes = async (
+    sourceId: string,
+    targetId: string,
+    relation: string,
+    label?: string,
+    confidence?: number,
+  ) => {
+    try {
+      const body: Record<string, unknown> = {
+        source: sourceId,
+        target: targetId,
+        relation,
+      }
+      if (label) body.label = label
+      if (confidence !== undefined) body.confidence = confidence
       const res = await fetch(`${API_BASE}/api/graph/edge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: sourceId, target: targetId, relation }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) {
         const text = await res.text()
@@ -245,9 +327,15 @@ export default function App() {
     }
   }
 
-  const handleDeleteEdge = async (source: string, relation: string, target: string) => {
+  const handleDeleteEdge = async (
+    source: string,
+    relation: string,
+    target: string,
+    label?: string,
+  ) => {
     try {
       const params = new URLSearchParams({ source, relation, target })
+      if (label) params.set('label', label)
       const res = await fetch(`${API_BASE}/api/graph/edge?${params}`, { method: 'DELETE' })
       if (!res.ok) {
         const text = await res.text()
@@ -260,12 +348,9 @@ export default function App() {
     }
   }
 
-  const lastAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant')
-  const nodeEvidence = selectedNode && lastAssistantMsg?.evidence
-    ? lastAssistantMsg.evidence.filter((c) =>
-        c.text.toLowerCase().includes(selectedNode.label.toLowerCase())
-      )
-    : []
+  // Evidence for the selected node — fetched from /api/graph/node/{id}
+  // (not derived from the last query, so it works for any clicked node).
+  const nodeEvidence = selectedNodeEvidence
 
   return (
     <div className={`flex h-screen overflow-hidden transition-colors duration-200 ${
@@ -273,11 +358,18 @@ export default function App() {
     }`}>
       {/* Sidebar — Graph Panel */}
       <aside
-        className={`flex flex-col border-r transition-all duration-300 overflow-hidden shrink-0 ${
-          isDark ? 'border-slate-800 bg-slate-900' : 'border-[#dde5f5] bg-[#f8faff]'
-        } ${sidebarOpen ? (maximized ? 'w-[55vw]' : 'w-80 xl:w-96') : 'w-0'}`}
+        className={`flex flex-col overflow-hidden ${
+          isDark ? 'bg-slate-900' : 'bg-[#f8faff]'
+        } ${fullscreen
+          ? `fixed inset-0 z-50 w-screen ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'}`
+          : `border-r transition-all duration-300 shrink-0 ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'} ${
+              sidebarOpen ? (maximized ? 'w-[55vw]' : 'w-80 xl:w-96') : 'w-0'
+            }`
+        }`}
       >
-        <div className={`flex-1 overflow-hidden flex flex-col ${maximized ? 'min-w-[55vw]' : 'min-w-80 xl:min-w-96'}`}>
+        <div className={`flex-1 overflow-hidden flex flex-col ${
+          fullscreen ? 'min-w-full' : maximized ? 'min-w-[55vw]' : 'min-w-80 xl:min-w-96'
+        }`}>
           {isGraphLoading && (
             <div className={`flex items-center justify-center gap-2 px-3 py-1.5 text-xs border-b ${
               isDark
@@ -297,24 +389,38 @@ export default function App() {
               selectedNodeId={selectedNode?.id ?? null}
               maximized={maximized}
               onMaximize={() => setMaximized((v) => !v)}
+              fullscreen={fullscreen}
+              onFullscreen={() => setFullscreen((v) => !v)}
               editMode={editMode}
               onEditModeChange={setEditMode}
               onAddNode={handleAddNode}
               onDeleteNode={handleDeleteNode}
               onConnectNodes={handleConnectNodes}
+              onViewDetails={(id) => {
+                const node = graph.nodes.find((n) => n.id === id)
+                if (node) {
+                  setSelectedNode(node)
+                  setTimeout(() => nodeDetailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+                }
+              }}
             />
           </Suspense>
           {selectedNode && (
+            <div ref={nodeDetailRef}>
             <NodeDetailPanel
               node={selectedNode}
               edges={graph.edges}
               allNodes={graph.nodes}
               evidence={nodeEvidence}
+              evidenceLoading={selectedNodeLoading}
+              apiBase={API_BASE}
               onClose={() => setSelectedNode(null)}
               editMode={editMode}
               onDeleteNode={handleDeleteNode}
               onDeleteEdge={handleDeleteEdge}
+              onUpdateNode={handleUpdateNode}
             />
+            </div>
           )}
         </div>
       </aside>
@@ -444,26 +550,23 @@ export default function App() {
                   trace its reasoning through the concept graph, and verify its answer.
                 </p>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-lg mt-2">
-                {[
-                  'What is Retrieval-Augmented Generation (RAG)?',
-                  'What is Stoquastic Hamiltonian?',
-                  'What is a adiabatic evolution ',
-                  'What is a quantum K-SAT problem?',
-                ].map((q) => (
-                  <button
-                    key={q}
-                    onClick={() => handleQuery(q)}
-                    className={`text-left text-xs border rounded-xl p-3 transition-all ${
-                      isDark
-                        ? 'text-slate-400 border-slate-700 hover:border-indigo-600 hover:text-slate-200 bg-slate-800/50 hover:bg-slate-800'
-                        : 'text-slate-600 border-slate-200 hover:border-indigo-300 hover:text-slate-800 bg-white hover:bg-indigo-50/50 shadow-sm'
-                    }`}
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
+              {suggestions.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-lg mt-2">
+                  {suggestions.slice(0, 4).map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => handleQuery(q)}
+                      className={`text-left text-xs border rounded-xl p-3 transition-all ${
+                        isDark
+                          ? 'text-slate-400 border-slate-700 hover:border-indigo-600 hover:text-slate-200 bg-slate-800/50 hover:bg-slate-800'
+                          : 'text-slate-600 border-slate-200 hover:border-indigo-300 hover:text-slate-800 bg-white hover:bg-indigo-50/50 shadow-sm'
+                      }`}
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -496,7 +599,7 @@ export default function App() {
           isDark ? 'border-slate-800 bg-slate-900/60' : 'border-[#dde5f5] bg-white/80'
         }`}>
           <div className="max-w-3xl mx-auto">
-            <QueryInput onSubmit={handleQuery} loading={loading} onFirstKeystroke={handleFirstKeystroke} />
+            <QueryInput onSubmit={handleQuery} loading={loading} onFirstKeystroke={handleFirstKeystroke} suggestions={suggestions} />
           </div>
         </div>
       </main>
@@ -504,7 +607,7 @@ export default function App() {
       {uploadOpen && (
         <UploadModal
           onClose={() => setUploadOpen(false)}
-          onSuccess={() => { loadGraph() }}
+          onSuccess={() => { loadGraph(); loadSuggestions() }}
         />
       )}
 

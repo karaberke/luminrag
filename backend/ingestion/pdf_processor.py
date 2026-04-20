@@ -30,6 +30,7 @@ from backend.schemas import Chunk
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_EXTENSIONS = {".pdf"}
+_MIN_IMAGE_DIM = 50  # px — skip hairlines and decorative rule images
 
 
 # ---------------------------------------------------------------------------
@@ -173,27 +174,83 @@ def _split_section(section: dict, max_chunk_chars: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Chunk assembly
+# Step 4 (new): Embedded image extraction per page
 # ---------------------------------------------------------------------------
 
-def _build_chunks(source_id: str, sections: list[dict]) -> list[Chunk]:
+def _extract_page_images(
+    doc: fitz.Document,
+    source_id: str,
+    images_dir: Path,
+) -> dict[int, list[str]]:
+    """
+    Extract embedded raster images from every page of *doc*.
+
+    Returns a mapping of ``{1-based page_number: [saved_png_path, ...]}``.
+    Images smaller than ``_MIN_IMAGE_DIM`` in either dimension are skipped
+    (they are typically decorative rules or icons, not content figures).
+    """
+    images_dir.mkdir(parents=True, exist_ok=True)
+    page_images: dict[int, list[str]] = {}
+
+    for page_num, page in enumerate(doc, start=1):
+        paths: list[str] = []
+        for img_idx, img_info in enumerate(page.get_images(full=True)):
+            xref = img_info[0]
+            width = img_info[2]
+            height = img_info[3]
+            if width < _MIN_IMAGE_DIM or height < _MIN_IMAGE_DIM:
+                continue
+            try:
+                image_data = doc.extract_image(xref)
+            except Exception as exc:
+                logger.debug(f"[{source_id}] Could not extract image xref={xref}: {exc}")
+                continue
+            ext = image_data.get("ext", "png")
+            out_path = images_dir / f"p{page_num:04d}_img{img_idx}.{ext}"
+            out_path.write_bytes(image_data["image"])
+            paths.append(str(out_path))
+            logger.debug(f"[{source_id}] Extracted image {out_path.name} ({width}×{height})")
+        if paths:
+            page_images[page_num] = paths
+
+    return page_images
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Chunk assembly
+# ---------------------------------------------------------------------------
+
+def _build_chunks(
+    source_id: str,
+    sections: list[dict],
+    page_images: dict[int, list[str]] | None = None,
+) -> list[Chunk]:
     chunks: list[Chunk] = []
     for section in sections:
         text = section["text"].strip()
         if not text:
             continue
+        p_start: int = section["page_start"]
+        p_end: int = section["page_end"]
+        images: list[str] = []
+        if page_images:
+            for pg in range(p_start, p_end + 1):
+                images.extend(page_images.get(pg, []))
+        metadata: dict = {
+            "page_start": p_start,
+            "page_end": p_end,
+            "section_title": section["title"],
+            "char_count": len(text),
+        }
+        if images:
+            metadata["image_paths"] = images
         chunks.append(
             Chunk(
                 id=f"{source_id}_chunk_{len(chunks)}",
                 text=text,
                 source_id=source_id,
                 modality="pdf",
-                metadata={
-                    "page_start": section["page_start"],
-                    "page_end": section["page_end"],
-                    "section_title": section["title"],
-                    "char_count": len(text),
-                },
+                metadata=metadata,
             )
         )
     return chunks
@@ -232,20 +289,28 @@ def process_pdf(pdf_path: str | Path, config: dict) -> list[Chunk]:
 
     doc = fitz.open(str(pdf_path))
     lines = _extract_lines(doc)
-    doc.close()
 
     if not lines:
+        doc.close()
         logger.warning(f"[{source_id}] No extractable text found — is this a scanned PDF?")
         return []
 
     logger.info(f"[{source_id}] {len(lines)} lines extracted, grouping into sections…")
     sections = _group_into_sections(lines, min_heading_size)
 
+    images_dir = Path("backend/data/processed/pdf_images") / source_id
+    page_images = _extract_page_images(doc, source_id, images_dir)
+    doc.close()
+
+    if page_images:
+        total = sum(len(v) for v in page_images.values())
+        logger.info(f"[{source_id}] Extracted {total} embedded image(s) from {len(page_images)} page(s)")
+
     logger.info(f"[{source_id}] {len(sections)} sections found, splitting oversized…")
     split_sections: list[dict] = []
     for section in sections:
         split_sections.extend(_split_section(section, max_chunk_chars))
 
-    chunks = _build_chunks(source_id, split_sections)
+    chunks = _build_chunks(source_id, split_sections, page_images=page_images)
     logger.info(f"[{source_id}] Done — {len(chunks)} chunks produced")
     return chunks

@@ -12,9 +12,16 @@ if (!(cytoscape as any)._fcoseRegistered) {
   ;(cytoscape as any)._fcoseRegistered = true
 }
 
-const RELATIONS = [
-  'PART_OF', 'PREREQUISITE', 'CAUSES', 'EXAMPLE_OF', 'EXPLAINS', 'BELONGS_TO_TOPIC',
-] as const
+const STRUCTURAL_RELATIONS = ['HAS_SUBTOPIC', 'HAS_CONTENT'] as const
+const SEMANTIC_RELATIONS = ['RELATED_TO'] as const
+const RELATIONS = [...STRUCTURAL_RELATIONS, ...SEMANTIC_RELATIONS] as const
+
+type NewNodeType = 'topic' | 'subtopic' | 'content'
+
+interface AddNodePayload {
+  name: string
+  node_type: NewNodeType
+}
 
 interface Props {
   graph: GraphData
@@ -22,11 +29,20 @@ interface Props {
   selectedNodeId: string | null
   maximized?: boolean
   onMaximize?: () => void
+  fullscreen?: boolean
+  onFullscreen?: () => void
   editMode?: boolean
   onEditModeChange?: (v: boolean) => void
-  onAddNode?: (name: string, nodeType: 'concept' | 'topic') => void
+  onAddNode?: (payload: AddNodePayload) => void
   onDeleteNode?: (nodeId: string) => void
-  onConnectNodes?: (sourceId: string, targetId: string, relation: string) => void
+  onConnectNodes?: (
+    sourceId: string,
+    targetId: string,
+    relation: string,
+    label?: string,
+    confidence?: number,
+  ) => void
+  onViewDetails?: (nodeId: string) => void
 }
 
 interface PendingEdge {
@@ -62,11 +78,14 @@ export default function GraphPanel({
   selectedNodeId,
   maximized,
   onMaximize,
+  fullscreen = false,
+  onFullscreen,
   editMode = false,
   onEditModeChange,
   onAddNode,
   onDeleteNode,
   onConnectNodes,
+  onViewDetails,
 }: Props) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -74,13 +93,14 @@ export default function GraphPanel({
   const [activeTab, setActiveTab] = useState<Tab>('full')
   const [connectingFromId, setConnectingFromId] = useState<string | null>(null)
   const [pendingEdge, setPendingEdge] = useState<PendingEdge | null>(null)
-  const [pendingRelation, setPendingRelation] = useState<string>('PART_OF')
+  const [pendingRelation, setPendingRelation] = useState<string>('HAS_SUBTOPIC')
   const [showAddNodeForm, setShowAddNodeForm] = useState(false)
   const [addNodeName, setAddNodeName] = useState('')
-  const [addNodeType, setAddNodeType] = useState<'concept' | 'topic'>('concept')
+  const [addNodeType, setAddNodeType] = useState<NewNodeType>('topic')
   const addNodeInputRef = useRef<HTMLInputElement>(null)
   const [collapsedTopics, setCollapsedTopics] = useState<Set<string>>(new Set())
   const [spacing, setSpacing] = useState(1) // 0.3–3× multiplier for layout spread
+  const [neighborMode, setNeighborMode] = useState(false)
 
   const cyFullRef = useRef<cytoscape.Core | null>(null)
   const cySubRef = useRef<cytoscape.Core | null>(null)
@@ -94,8 +114,14 @@ export default function GraphPanel({
   // from here instead of closing over stale render-time values.
   // Updated every render so handlers never see old values.
   // -----------------------------------------------------------------------
-  const latestRef = useRef({ connectingFromId, graph, onNodeClick, pendingEdge, showAddNodeForm })
-  latestRef.current = { connectingFromId, graph, onNodeClick, pendingEdge, showAddNodeForm }
+  const latestRef = useRef({
+    connectingFromId, graph, onNodeClick, pendingEdge, showAddNodeForm,
+    fullscreen, onFullscreen,
+  })
+  latestRef.current = {
+    connectingFromId, graph, onNodeClick, pendingEdge, showAddNodeForm,
+    fullscreen, onFullscreen,
+  }
 
   // Keys for topology-change detection — computed once per render, not inside effects
   const prevFullKeyRef = useRef('__unset__')
@@ -115,7 +141,7 @@ export default function GraphPanel({
   }, [])
 
   const allTopicIds = useMemo(
-    () => graph.nodes.filter(n => n.type === 'topic').map(n => n.id),
+    () => graph.nodes.filter(n => n.node_type === 'topic').map(n => n.id),
     [graph.nodes],
   )
 
@@ -130,7 +156,7 @@ export default function GraphPanel({
   // Prune stale collapsed topics when graph changes
   useEffect(() => {
     setCollapsedTopics(prev => {
-      const validIds = new Set(graph.nodes.filter(n => n.type === 'topic').map(n => n.id))
+      const validIds = new Set(graph.nodes.filter(n => n.node_type === 'topic').map(n => n.id))
       let changed = false
       for (const tid of prev) {
         if (!validIds.has(tid)) { changed = true; break }
@@ -149,23 +175,44 @@ export default function GraphPanel({
     if (collapsedTopics.size === 0) {
       return { filteredNodes: graph.nodes, filteredEdges: graph.edges, collapseCountMap: new Map<string, number>() }
     }
+    // Build downward adjacency (topic/subtopic → children) via HAS_* edges.
+    const HIERARCHY_RELS = new Set(['HAS_SUBTOPIC', 'HAS_CONTENT'])
+    const out = new Map<string, string[]>()
+    for (const e of graph.edges) {
+      if (HIERARCHY_RELS.has(e.relation)) {
+        if (!out.has(e.source)) out.set(e.source, [])
+        out.get(e.source)!.push(e.target)
+      }
+    }
+    const descendantsOf = (rootId: string): Set<string> => {
+      const seen = new Set<string>()
+      const queue = [rootId]
+      while (queue.length) {
+        const cur = queue.shift()!
+        for (const nxt of out.get(cur) ?? []) {
+          if (!seen.has(nxt)) { seen.add(nxt); queue.push(nxt) }
+        }
+      }
+      return seen
+    }
+
+    // Protect descendants reachable from any non-collapsed topic.
+    const protectedIds = new Set<string>()
+    for (const n of graph.nodes) {
+      if (n.node_type !== 'topic' || collapsedTopics.has(n.id)) continue
+      for (const d of descendantsOf(n.id)) protectedIds.add(d)
+    }
+
     const hiddenNodeIds = new Set<string>()
     const countMap = new Map<string, number>()
     for (const topicId of collapsedTopics) {
-      const children = graph.edges
-        .filter(e => e.relation === 'BELONGS_TO_TOPIC' && e.target === topicId)
-        .map(e => e.source)
       let count = 0
-      for (const childId of children) {
-        const node = graph.nodes.find(n => n.id === childId)
-        if (node?.type === 'topic') continue
-        const belongsToNonCollapsedTopic = graph.edges.some(
-          e => e.relation === 'BELONGS_TO_TOPIC' && e.source === childId && e.target !== topicId && !collapsedTopics.has(e.target)
-        )
-        if (!belongsToNonCollapsedTopic) {
-          hiddenNodeIds.add(childId)
-          count++
-        }
+      for (const d of descendantsOf(topicId)) {
+        if (protectedIds.has(d)) continue
+        const child = graph.nodes.find(n => n.id === d)
+        if (child?.node_type === 'topic') continue
+        hiddenNodeIds.add(d)
+        count++
       }
       countMap.set(topicId, count)
     }
@@ -213,8 +260,32 @@ export default function GraphPanel({
       {
         selector: 'node.topic',
         style: {
+          'background-color': isDark ? '#312e81' : '#e0e7ff',
+          'border-color': isDark ? '#4f46e5' : '#818cf8',
+          'border-width': 2,
+          width: 110,
+          height: 44,
+          'font-size': 11,
+          'font-weight': 'bold',
+        },
+      },
+      {
+        selector: 'node.subtopic',
+        style: {
+          'background-color': isDark ? '#581c87' : '#faf5ff',
+          'border-color': isDark ? '#a855f7' : '#d8b4fe',
+          width: 100,
+          height: 40,
+        },
+      },
+      {
+        selector: 'node.content',
+        style: {
           'background-color': isDark ? '#0f766e' : '#ccfbf1',
           'border-color': isDark ? '#0d9488' : '#5eead4',
+          width: 85,
+          height: 32,
+          'font-size': 9,
         },
       },
       {
@@ -278,6 +349,10 @@ export default function GraphPanel({
           'font-weight': 'bold',
         },
       },
+      {
+        selector: 'node.dimmed',
+        style: { opacity: 0.12 },
+      },
     ],
     [isDark],
   )
@@ -291,29 +366,60 @@ export default function GraphPanel({
     [filteredNodes],
   )
 
+  // BFS over all edges (undirected) to find the full connected component of
+  // the selected node. Used for neighbor-highlight mode.
+  const neighborSet = useMemo<Set<string>>(() => {
+    if (!neighborMode || !selectedNodeId) return new Set()
+    const adj = new Map<string, Set<string>>()
+    for (const e of graph.edges) {
+      if (!adj.has(e.source)) adj.set(e.source, new Set())
+      if (!adj.has(e.target)) adj.set(e.target, new Set())
+      adj.get(e.source)!.add(e.target)
+      adj.get(e.target)!.add(e.source)
+    }
+    const visited = new Set<string>()
+    const queue = [selectedNodeId]
+    while (queue.length) {
+      const cur = queue.shift()!
+      if (visited.has(cur)) continue
+      visited.add(cur)
+      adj.get(cur)?.forEach((nb) => { if (!visited.has(nb)) queue.push(nb) })
+    }
+    return visited
+  }, [neighborMode, selectedNodeId, graph.edges])
+
+  // Reset neighbor mode whenever the selected node changes
+  useEffect(() => { setNeighborMode(false) }, [selectedNodeId])
+
   const fullElements = useMemo<cytoscape.ElementDefinition[]>(
     () => [
       ...filteredNodes.map((n) => ({
         data: {
           id: n.id,
           label: collapsedTopics.has(n.id)
-            ? `${n.label} (${collapseCountMap.get(n.id) ?? 0})`
-            : n.label,
+            ? `${n.name} (${collapseCountMap.get(n.id) ?? 0})`
+            : n.name,
         },
         classes: [
-          n.type === 'topic'             ? 'topic'          : '',
-          n.highlighted                  ? 'highlighted'    : '',
-          n.id === selectedNodeId        ? 'selected'       : '',
-          n.id === connectingFromId      ? 'connecting-src' : '',
-          collapsedTopics.has(n.id)      ? 'collapsed'      : '',
+          n.node_type,                                          // topic | subtopic | content
+          n.highlighted                                          ? 'highlighted'    : '',
+          n.id === selectedNodeId                                ? 'selected'       : '',
+          n.id === connectingFromId                              ? 'connecting-src' : '',
+          collapsedTopics.has(n.id)                             ? 'collapsed'      : '',
+          neighborMode && neighborSet.size > 0 && !neighborSet.has(n.id) ? 'dimmed' : '',
         ].filter(Boolean).join(' '),
       })),
       ...filteredEdges.map((e) => ({
-        data: { id: e.id, source: e.source, target: e.target, label: e.relation },
+        data: {
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          label: e.relation === 'RELATED_TO' && e.label ? e.label : e.relation,
+        },
         classes: e.highlighted ? 'highlighted' : '',
       })),
     ],
-    [filteredNodes, filteredEdges, selectedNodeId, connectingFromId, collapsedTopics, collapseCountMap],
+    [filteredNodes, filteredEdges, selectedNodeId, connectingFromId, collapsedTopics, collapseCountMap, neighborMode, neighborSet],
   )
 
   const subElements = useMemo<cytoscape.ElementDefinition[]>(
@@ -324,12 +430,12 @@ export default function GraphPanel({
           data: {
             id: n.id,
             label: collapsedTopics.has(n.id)
-              ? `${n.label} (${collapseCountMap.get(n.id) ?? 0})`
-              : n.label,
+              ? `${n.name} (${collapseCountMap.get(n.id) ?? 0})`
+              : n.name,
           },
           classes: [
             'highlighted',
-            n.type === 'topic'             ? 'topic'     : '',
+            n.node_type,                                     // topic | subtopic | content
             n.id === selectedNodeId        ? 'selected'  : '',
             collapsedTopics.has(n.id)      ? 'collapsed' : '',
           ].filter(Boolean).join(' '),
@@ -337,7 +443,12 @@ export default function GraphPanel({
       ...filteredEdges
         .filter((e) => highlightedIds.has(e.source) && highlightedIds.has(e.target))
         .map((e) => ({
-          data: { id: e.id, source: e.source, target: e.target, label: e.relation },
+          data: {
+            id: e.id,
+            source: e.source,
+            target: e.target,
+            label: e.relation === 'RELATED_TO' && e.label ? e.label : e.relation,
+          },
           classes: 'highlighted',
         })),
     ],
@@ -452,7 +563,7 @@ export default function GraphPanel({
           targetId: nodeId,
           targetLabel: evt.target.data('label'),
         })
-        setPendingRelation('PART_OF')
+        setPendingRelation('HAS_SUBTOPIC')
         setConnectingFromId(null)
         return
       }
@@ -509,10 +620,14 @@ export default function GraphPanel({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      const { pendingEdge: pe, connectingFromId: cid, showAddNodeForm: saf } = latestRef.current
+      const {
+        pendingEdge: pe, connectingFromId: cid, showAddNodeForm: saf,
+        fullscreen: fs, onFullscreen: exitFs,
+      } = latestRef.current
       if (pe)  { setPendingEdge(null);    return }
       if (cid) { setConnectingFromId(null); return }
-      if (saf) { setShowAddNodeForm(false); setAddNodeName('') }
+      if (saf) { setShowAddNodeForm(false); setAddNodeName(''); return }
+      if (fs && exitFs) exitFs()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -532,17 +647,28 @@ export default function GraphPanel({
   const confirmAddNode = useCallback(() => {
     const name = addNodeName.trim()
     if (!name) return
-    onAddNode?.(name, addNodeType)
+    onAddNode?.({ name, node_type: addNodeType })
     setShowAddNodeForm(false)
     setAddNodeName('')
-    setAddNodeType('concept')
+    setAddNodeType('topic')
   }, [addNodeName, addNodeType, onAddNode])
 
+  const [pendingRelationLabel, setPendingRelationLabel] = useState('')
+
   const confirmEdge = useCallback(() => {
-    if (!pendingEdge || !pendingRelation.trim()) return
-    onConnectNodes?.(pendingEdge.sourceId, pendingEdge.targetId, pendingRelation.trim())
+    if (!pendingEdge) return
+    const relation = pendingRelation.trim().toUpperCase()
+    if (!relation) return
+    if (relation === 'RELATED_TO') {
+      const label = pendingRelationLabel.trim()
+      if (!label) return
+      onConnectNodes?.(pendingEdge.sourceId, pendingEdge.targetId, relation, label)
+    } else {
+      onConnectNodes?.(pendingEdge.sourceId, pendingEdge.targetId, relation)
+    }
     setPendingEdge(null)
-  }, [pendingEdge, pendingRelation, onConnectNodes])
+    setPendingRelationLabel('')
+  }, [pendingEdge, pendingRelation, pendingRelationLabel, onConnectNodes])
 
   // -----------------------------------------------------------------------
   // Zoom helpers
@@ -561,15 +687,15 @@ export default function GraphPanel({
     [filteredEdges, highlightedIds],
   )
   const connectingLabel = useMemo(
-    () => graph.nodes.find((n) => n.id === connectingFromId)?.label ?? connectingFromId,
+    () => graph.nodes.find((n) => n.id === connectingFromId)?.name ?? connectingFromId,
     [graph.nodes, connectingFromId],
   )
   const selectedLabel = useMemo(
-    () => graph.nodes.find((n) => n.id === selectedNodeId)?.label ?? selectedNodeId,
+    () => graph.nodes.find((n) => n.id === selectedNodeId)?.name ?? selectedNodeId,
     [graph.nodes, selectedNodeId],
   )
   const selectedNodeType = useMemo(
-    () => graph.nodes.find((n) => n.id === selectedNodeId)?.type,
+    () => graph.nodes.find((n) => n.id === selectedNodeId)?.node_type,
     [graph.nodes, selectedNodeId],
   )
 
@@ -681,8 +807,8 @@ export default function GraphPanel({
             </button>
           )}
 
-          {onMaximize && (
-            <button onClick={onMaximize} className={`${btnCls} ml-1`} title={maximized ? 'Restore' : 'Expand graph'}>
+          {onMaximize && !fullscreen && (
+            <button onClick={onMaximize} className={`${btnCls} ml-1`} title={maximized ? 'Restore sidebar' : 'Expand sidebar'}>
               {maximized ? (
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
                   <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" strokeLinecap="round" />
@@ -690,6 +816,26 @@ export default function GraphPanel({
               ) : (
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
                   <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" strokeLinecap="round" />
+                </svg>
+              )}
+            </button>
+          )}
+
+          {onFullscreen && (
+            <button
+              onClick={onFullscreen}
+              className={`${btnCls} ${fullscreen ? (isDark ? 'text-indigo-400 bg-slate-700/80' : 'text-indigo-600 bg-indigo-50') : ''}`}
+              title={fullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen graph'}
+            >
+              {fullscreen ? (
+                /* Exit fullscreen — arrows pointing inward */
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+                  <path d="M10 2v4h4M2 10h4v4M6 6L2 2M10 6l4-4M6 10l-4 4M10 10l4 4" strokeLinecap="round" />
+                </svg>
+              ) : (
+                /* Enter fullscreen — arrows pointing outward to corners */
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+                  <path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4M2 2l4 4M14 2l-4 4M2 14l4-4M14 14l-4-4" strokeLinecap="round" />
                 </svg>
               )}
             </button>
@@ -714,7 +860,7 @@ export default function GraphPanel({
             }`}
           />
           <div className="flex items-center gap-3">
-            {(['concept', 'topic'] as const).map((t) => (
+            {(['topic', 'subtopic', 'content'] as const).map((t) => (
               <label key={t} className={`flex items-center gap-1.5 text-xs cursor-pointer ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
                 <input type="radio" name="nodeType" value={t} checked={addNodeType === t} onChange={() => setAddNodeType(t)} className="accent-indigo-500" />
                 {t.charAt(0).toUpperCase() + t.slice(1)}
@@ -869,6 +1015,33 @@ export default function GraphPanel({
                   {selectedLabel}
                 </span>
 
+                {/* View Details button — always visible when a node is selected */}
+                <button
+                  onClick={() => onViewDetails?.(selectedNodeId)}
+                  className={`text-xs px-2 py-0.5 rounded ${
+                    isDark
+                      ? 'bg-indigo-700/80 hover:bg-indigo-600 text-white'
+                      : 'bg-indigo-500/90 hover:bg-indigo-600 text-white'
+                  }`}
+                >
+                  View Details
+                </button>
+
+                {/* Neighbor highlight toggle */}
+                <button
+                  onClick={() => setNeighborMode((v) => !v)}
+                  className={`text-xs px-2 py-0.5 rounded ${
+                    neighborMode
+                      ? 'bg-violet-600 hover:bg-violet-500 text-white'
+                      : isDark
+                        ? 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+                        : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
+                  }`}
+                  title="Highlight all nodes connected to this one"
+                >
+                  Neighbors
+                </button>
+
                 {/* Collapse/Expand — shown for topic nodes regardless of edit mode */}
                 {selectedNodeType === 'topic' && (
                   <button
@@ -894,7 +1067,7 @@ export default function GraphPanel({
                     <button
                       onClick={() => {
                         const node = graph.nodes.find((n) => n.id === selectedNodeId)
-                        if (node) handleDeleteNodeClick(node.id, node.label)
+                        if (node) handleDeleteNodeClick(node.id, node.name)
                       }}
                       className="text-xs px-2 py-0.5 rounded bg-red-700/80 hover:bg-red-600 text-white"
                     >
@@ -917,12 +1090,12 @@ export default function GraphPanel({
                     <span className={isDark ? 'text-slate-500' : 'text-slate-400'}>→</span>
                     <span className="font-semibold text-indigo-400">{pendingEdge.targetLabel}</span>
                   </div>
-                  <label className={`text-xs mb-1 block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>Relation label</label>
+                  <label className={`text-xs mb-1 block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>Relation</label>
                   <input
                     list="relation-suggestions"
                     value={pendingRelation}
                     onChange={(e) => setPendingRelation(e.target.value.toUpperCase())}
-                    placeholder="PART_OF, CAUSES, or custom…"
+                    placeholder="HAS_SUBTOPIC, HAS_CONTENT, RELATED_TO…"
                     autoFocus
                     className={`w-full text-xs border rounded px-2 py-1.5 outline-none focus:border-indigo-500 mb-3 ${
                       isDark ? 'bg-slate-700 border-slate-600 text-slate-200' : 'bg-slate-50 border-slate-200 text-slate-800'
@@ -931,10 +1104,28 @@ export default function GraphPanel({
                   <datalist id="relation-suggestions">
                     {RELATIONS.map((r) => <option key={r} value={r} />)}
                   </datalist>
+                  {pendingRelation.trim().toUpperCase() === 'RELATED_TO' && (
+                    <>
+                      <label className={`text-xs mb-1 block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                        Label (free-form verb phrase)
+                      </label>
+                      <input
+                        value={pendingRelationLabel}
+                        onChange={(e) => setPendingRelationLabel(e.target.value)}
+                        placeholder="uses, generalises, prerequisite for…"
+                        className={`w-full text-xs border rounded px-2 py-1.5 outline-none focus:border-indigo-500 mb-3 ${
+                          isDark ? 'bg-slate-700 border-slate-600 text-slate-200' : 'bg-slate-50 border-slate-200 text-slate-800'
+                        }`}
+                      />
+                    </>
+                  )}
                   <div className="flex gap-2">
                     <button
                       onClick={confirmEdge}
-                      disabled={!pendingRelation.trim()}
+                      disabled={
+                        !pendingRelation.trim() ||
+                        (pendingRelation.trim().toUpperCase() === 'RELATED_TO' && !pendingRelationLabel.trim())
+                      }
                       className="flex-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-1 rounded"
                     >
                       Add Edge
@@ -957,11 +1148,11 @@ export default function GraphPanel({
       <div className="px-4 pb-3 flex gap-4 flex-wrap shrink-0">
         {activeTab === 'full' ? (
           <>
-            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-indigo-500" /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Visited</span></div>
-            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full ${isDark ? 'bg-teal-700' : 'bg-teal-200'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Topic</span></div>
-            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full ${isDark ? 'bg-slate-700' : 'bg-indigo-100'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Concept</span></div>
+            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full ${isDark ? 'bg-indigo-900 border border-indigo-500' : 'bg-indigo-100 border border-indigo-400'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Topic</span></div>
+            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full ${isDark ? 'bg-purple-900 border border-purple-500' : 'bg-purple-100 border border-purple-400'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Subtopic</span></div>
+            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full ${isDark ? 'bg-teal-900 border border-teal-500' : 'bg-teal-100 border border-teal-400'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Content</span></div>
+            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded-full bg-indigo-500`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Retrieved</span></div>
             <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-amber-500" /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Selected</span></div>
-            <div className="flex items-center gap-1.5"><div className={`w-3 h-3 rounded border-dashed border ${isDark ? 'bg-teal-900 border-teal-500' : 'bg-teal-100 border-teal-500'}`} /><span className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Collapsed</span></div>
             {editMode && <div className={`text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>· Select a node to Connect or Delete it</div>}
           </>
         ) : (

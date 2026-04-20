@@ -38,7 +38,7 @@ def base_config() -> dict:
         "whisper": {"model_size": "tiny", "device": "cpu", "compute_type": "int8"},
         "captioning": {
             "provider": "ollama",
-            "ollama_model": "llava:13b",
+            "ollama_model": "llama3.2-vision",
             "ollama_base_url": "http://localhost:11434",
             "anthropic_model": "claude-haiku-4-5-20251001",
             "max_tokens": 150,
