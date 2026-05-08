@@ -154,3 +154,16 @@ semantic_linker:
 illustration_worker:
   enabled: true
   latex_dpi: 150            # DPI for equation PNG renders
+
+# ----------------------------------------------------------------------
+# Quiz & Exam Generator
+# ----------------------------------------------------------------------
+
+quiz_generator:
+  provider: ollama
+  ollama_model: qwen2.5:7b
+  ollama_base_url: http://localhost:11434
+  anthropic_model: claude-haiku-4-5-20251001
+  max_tokens: 8192
+  context_chars: 24000
+  batch_size: 1   # qwen2.5:7b reliably returns 1 question per call; set higher for larger models

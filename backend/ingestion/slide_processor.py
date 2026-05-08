@@ -22,7 +22,7 @@ from pathlib import Path
 
 import fitz  # pymupdf
 
-from backend.ingestion.captioners import BaseCaptioner, build_captioner
+from backend.ingestion.captioners import BaseCaptioner, build_captioner, safe_caption
 from backend.schemas import Chunk
 
 logger = logging.getLogger(__name__)
@@ -68,11 +68,7 @@ def _process_page(
     img_path = slide_dir / f"slide_{page_number:04d}.jpg"
     _render_page(page, img_path, dpi)
 
-    caption = ""
-    try:
-        caption = captioner.caption(img_path)
-    except Exception as exc:
-        logger.warning(f"[{source_id}] Captioning failed for page {page_number}: {exc}")
+    caption = safe_caption(captioner, img_path, f"{source_id} page {page_number}")
 
     full_text = f"[Visual: {caption}] {text}" if caption else text
 

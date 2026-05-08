@@ -83,7 +83,7 @@ class TestLinkNodes:
             {"key": "t1", "name": "X", "text": "X", "node_type": "topic"},
             {"key": "t2", "name": "Y", "text": "Y", "node_type": "topic"},
         ]
-        with patch("backend.graph.semantic_linker.call_llm") as mock_llm:
+        with patch("backend.graph.semantic_linker.safe_call_json") as mock_llm:
             result = link_nodes(nodes, emb, config)
         mock_llm.assert_not_called()  # no candidates → no LLM calls
         assert result == []
@@ -96,10 +96,10 @@ class TestLinkNodes:
             {"key": "t2", "name": "Graph Theory", "text": "Graph Theory math",
              "node_type": "topic"},
         ]
-        with patch("backend.graph.semantic_linker.call_llm") as mock_llm:
-            mock_llm.return_value = (
-                '[{"index": 0, "label": "uses", "confidence": 0.8}]'
-            )
+        with patch("backend.graph.semantic_linker.safe_call_json") as mock_llm:
+            mock_llm.return_value = [
+                {"index": 0, "label": "uses", "confidence": 0.8}
+            ]
             proposals = link_nodes(nodes, emb, config)
         assert len(proposals) == 1
         assert proposals[0].source_key in {"t1", "t2"}
@@ -114,10 +114,10 @@ class TestLinkNodes:
             {"key": "t2", "name": "Graph Theory", "text": "Graph Theory",
              "node_type": "topic"},
         ]
-        with patch("backend.graph.semantic_linker.call_llm") as mock_llm:
-            mock_llm.return_value = (
-                '[{"index": 0, "label": "uses", "confidence": 0.1}]'
-            )
+        with patch("backend.graph.semantic_linker.safe_call_json") as mock_llm:
+            mock_llm.return_value = [
+                {"index": 0, "label": "uses", "confidence": 0.1}
+            ]
             proposals = link_nodes(nodes, emb, config)
         assert proposals == []
 
@@ -128,7 +128,8 @@ class TestLinkNodes:
             {"key": "t2", "name": "Graph Theory", "text": "Graph Theory",
              "node_type": "topic"},
         ]
-        with patch("backend.graph.semantic_linker.call_llm", side_effect=Exception("boom")):
+        # safe_call_json swallows transport and parse failures, returning [].
+        with patch("backend.graph.semantic_linker.safe_call_json", return_value=[]):
             proposals = link_nodes(nodes, emb, config)
         assert proposals == []
 

@@ -1,29 +1,9 @@
 import type { EvidenceChunk } from '../types'
 import { useTheme } from '../ThemeContext'
 import { RichText } from './RichText'
+import { chunkSourceUrl } from '../utils/source'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
-
-function parseTimestamp(ts: string | undefined): number | null {
-  if (!ts) return null
-  const parts = ts.split(':').map((p) => parseInt(p, 10))
-  if (parts.some(Number.isNaN)) return null
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  return null
-}
-
-function sourceUrl(chunk: EvidenceChunk): string {
-  const base = `${API_BASE}/api/source/${encodeURIComponent(chunk.source)}`
-  if ((chunk.modality === 'pdf' || chunk.modality === 'slide') && chunk.page != null) {
-    return `${base}#page=${chunk.page}`
-  }
-  if (chunk.modality === 'video' || chunk.modality === 'audio') {
-    const secs = parseTimestamp(chunk.timestamp)
-    if (secs != null) return `${base}#t=${secs}`
-  }
-  return base
-}
 
 const modalityIcon: Record<EvidenceChunk['modality'], string> = {
   video: '▶',
@@ -74,7 +54,7 @@ export default function EvidenceChip({ chunk, index, highlighted = false }: Prop
 
   return (
     <div className={`rounded-lg border p-3 text-xs transition-shadow duration-300 ${color} ${
-      highlighted ? (isDark ? 'ring-2 ring-indigo-400' : 'ring-2 ring-indigo-400') : ''
+      highlighted ? 'ring-2 ring-indigo-400' : ''
     }`}>
       <div className="flex items-center gap-2 mb-1.5">
         <span className="font-mono text-base leading-none">{modalityIcon[chunk.modality]}</span>
@@ -83,7 +63,7 @@ export default function EvidenceChip({ chunk, index, highlighted = false }: Prop
           {chunk.page ? `p.${chunk.page}` : chunk.timestamp ? `@${chunk.timestamp}` : ''}
         </span>
         <a
-          href={sourceUrl(chunk)}
+          href={chunkSourceUrl(API_BASE, chunk)}
           target="_blank"
           rel="noreferrer"
           className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${

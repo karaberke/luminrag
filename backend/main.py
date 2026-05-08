@@ -382,6 +382,63 @@ class _IngestJob:
 _jobs: dict[str, _IngestJob] = {}
 
 
+# ---------------------------------------------------------------------------
+# Quiz job state
+# ---------------------------------------------------------------------------
+
+from backend.quiz.schemas import (  # noqa: E402
+    GradeQuizRequest,
+    HintResponse,
+    QuizConfig,
+    QuizJobResponse,
+    QuizJobStatusResponse,
+    QuizQuestionResponse,
+    StoredQuiz,
+)
+
+
+@dataclasses.dataclass
+class _QuizJob:
+    job_id: str
+    status: Literal["queued", "running", "done", "failed"] = "queued"
+    progress: str = "Queued"
+    quiz_id: str | None = None
+    error: str | None = None
+
+
+_quiz_jobs: dict[str, _QuizJob] = {}
+_quizzes: dict[str, StoredQuiz] = {}
+
+
+class QuestionResultResponse(BaseModel):
+    question_id: str
+    question_text: str
+    question_type: str
+    user_answer: str
+    correct_answer: str
+    is_correct: bool
+    score: float
+    explanation: str
+    evidence: list[EvidenceChunkResponse]
+
+
+class GradeQuizResponse(BaseModel):
+    quiz_id: str
+    total_score: float
+    num_correct: int
+    num_total: int
+    results: list[QuestionResultResponse]
+    knowledge_gaps: list[str]
+    recommended_study_areas: list[str]
+
+
+class DeepDiveResponse(BaseModel):
+    concept: str
+    study_guide: str
+    key_takeaways: list[str]
+    evidence: list[EvidenceChunkResponse]
+
+
 _CONTENT_TYPES = {
     "definition", "theorem", "technique", "example", "question", "figure", "other"
 }
@@ -776,6 +833,67 @@ async def _run_ingest_job(
         logger.exception(f"Ingest job {job_id} failed: {exc}")
         job.error = str(exc)
         job.progress_stage = "Failed"
+        job.status = "failed"
+
+
+def _chunk_ids_to_evidence(chunk_ids: list[str]) -> list[EvidenceChunkResponse]:
+    """Resolve a list of chunk IDs to EvidenceChunkResponse objects via the document store."""
+    if not state.store:
+        return []
+    evidence: list[EvidenceChunkResponse] = []
+    for cid in chunk_ids:
+        chunk = state.store.get_chunk(cid)
+        if not chunk:
+            continue
+        meta = chunk.metadata or {}
+        page = meta.get("page_number") or meta.get("page_start")
+        ts_raw = meta.get("start_time")
+        timestamp: str | None = None
+        if ts_raw is not None:
+            secs = int(float(ts_raw))
+            timestamp = f"{secs // 60}:{secs % 60:02d}"
+        evidence.append(
+            EvidenceChunkResponse(
+                id=chunk.id,
+                text=chunk.text[:500],
+                source=chunk.source_id,
+                modality=chunk.modality,
+                page=int(page) if page is not None else None,
+                timestamp=timestamp,
+            )
+        )
+    return evidence
+
+
+async def _run_quiz_job(job_id: str, config: QuizConfig) -> None:
+    from backend.quiz.generator import generate_quiz
+
+    job = _quiz_jobs[job_id]
+    try:
+        job.status = "running"
+        job.progress = "Retrieving context from knowledge base…"
+
+        def _update_progress(msg: str) -> None:
+            job.progress = msg
+
+        quiz = await asyncio.to_thread(
+            generate_quiz,
+            config,
+            state.vector_index if state.index_loaded else None,
+            state.graph_builder if state.graph_loaded else None,
+            state.store,
+            state.embedder,
+            state.config,
+            _update_progress,
+        )
+        _quizzes[quiz.quiz_id] = quiz
+        job.quiz_id = quiz.quiz_id
+        job.progress = "Done"
+        job.status = "done"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Quiz job %s failed: %s", job_id, exc)
+        job.error = str(exc)
+        job.progress = "Failed"
         job.status = "failed"
 
 
@@ -1415,3 +1533,164 @@ def delete_graph_edge(
 
     _persist_graph(builder)
     return {"deleted": f"{source}__{label or relation}__{target}"}
+
+
+# ---------------------------------------------------------------------------
+# Quiz endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/quiz/generate", response_model=QuizJobResponse, status_code=202)
+async def generate_quiz_endpoint(config: QuizConfig) -> QuizJobResponse:
+    if not state.store:
+        raise HTTPException(status_code=503, detail="Document store not initialized.")
+    if state.store.count() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents ingested. Please upload course materials first.",
+        )
+    if not config.question_types:
+        raise HTTPException(
+            status_code=422, detail="At least one question type must be selected."
+        )
+    config.num_questions = max(1, min(config.num_questions, 20))
+
+    job_id = str(uuid.uuid4())
+    _quiz_jobs[job_id] = _QuizJob(job_id=job_id)
+    asyncio.create_task(_run_quiz_job(job_id, config))
+    return QuizJobResponse(job_id=job_id, status="queued")
+
+
+@app.get("/api/quiz/jobs/{job_id}", response_model=QuizJobStatusResponse)
+def get_quiz_job(job_id: str) -> QuizJobStatusResponse:
+    job = _quiz_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Quiz job not found.")
+
+    questions: list[QuizQuestionResponse] | None = None
+    if job.status == "done" and job.quiz_id:
+        stored = _quizzes.get(job.quiz_id)
+        if stored:
+            questions = [
+                QuizQuestionResponse(
+                    id=q.id,
+                    question_type=q.question_type,
+                    question_text=q.question_text,
+                    options=q.options,
+                    difficulty=q.difficulty,
+                )
+                for q in stored.questions
+            ]
+
+    return QuizJobStatusResponse(
+        job_id=job_id,
+        status=job.status,
+        progress=job.progress,
+        quiz_id=job.quiz_id,
+        questions=questions,
+        error=job.error,
+    )
+
+
+@app.get("/api/quiz/{quiz_id}/hint/{question_id}", response_model=HintResponse)
+def get_quiz_hint(quiz_id: str, question_id: str) -> HintResponse:
+    stored = _quizzes.get(quiz_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+    q = next((q for q in stored.questions if q.id == question_id), None)
+    if q is None:
+        raise HTTPException(status_code=404, detail="Question not found.")
+
+    related_concepts: list[str] = []
+    if state.graph_builder and q.source_node_keys:
+        graph = state.graph_builder.graph
+        seen: set[str] = set()
+        for node_key in q.source_node_keys[:3]:
+            if node_key not in graph:
+                continue
+            neighbors = list(graph.successors(node_key)) + list(graph.predecessors(node_key))
+            for neighbor in neighbors:
+                attrs = graph.nodes.get(neighbor, {})
+                name = attrs.get("name", "")
+                if name and attrs.get("node_type") != "chunk_ref" and name not in seen:
+                    seen.add(name)
+                    related_concepts.append(name)
+                if len(related_concepts) >= 5:
+                    break
+            if len(related_concepts) >= 5:
+                break
+
+    return HintResponse(hint=q.hint, related_concepts=related_concepts[:5])
+
+
+@app.post("/api/quiz/{quiz_id}/grade", response_model=GradeQuizResponse)
+async def grade_quiz_endpoint(quiz_id: str, request: GradeQuizRequest) -> GradeQuizResponse:
+    stored = _quizzes.get(quiz_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+    if not state.store:
+        raise HTTPException(status_code=503, detail="Document store not initialized.")
+
+    from backend.quiz.grader import grade_quiz
+
+    result = await asyncio.to_thread(
+        grade_quiz,
+        stored,
+        request.answers,
+        state.store,
+        state.graph_builder if state.graph_loaded else None,
+        state.config,
+    )
+
+    http_results = [
+        QuestionResultResponse(
+            question_id=r.question_id,
+            question_text=r.question_text,
+            question_type=r.question_type,
+            user_answer=r.user_answer,
+            correct_answer=r.correct_answer,
+            is_correct=r.is_correct,
+            score=r.score,
+            explanation=r.explanation,
+            evidence=_chunk_ids_to_evidence(r.source_chunk_ids),
+        )
+        for r in result.results
+    ]
+
+    return GradeQuizResponse(
+        quiz_id=result.quiz_id,
+        total_score=result.total_score,
+        num_correct=result.num_correct,
+        num_total=result.num_total,
+        results=http_results,
+        knowledge_gaps=result.knowledge_gaps,
+        recommended_study_areas=result.recommended_study_areas,
+    )
+
+
+@app.post("/api/quiz/{quiz_id}/deep-dive/{question_id}", response_model=DeepDiveResponse)
+async def deep_dive_endpoint(quiz_id: str, question_id: str) -> DeepDiveResponse:
+    stored = _quizzes.get(quiz_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+    if not state.store:
+        raise HTTPException(status_code=503, detail="Document store not initialized.")
+
+    from backend.quiz.grader import get_deep_dive
+
+    result = await asyncio.to_thread(
+        get_deep_dive,
+        stored,
+        question_id,
+        state.vector_index if state.index_loaded else None,
+        state.graph_builder if state.graph_loaded else None,
+        state.store,
+        state.embedder,
+        state.config,
+    )
+
+    return DeepDiveResponse(
+        concept=result.concept,
+        study_guide=result.study_guide,
+        key_takeaways=result.key_takeaways,
+        evidence=_chunk_ids_to_evidence(result.source_chunk_ids),
+    )

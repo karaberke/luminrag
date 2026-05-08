@@ -5,10 +5,15 @@ import MessageBubble from './components/MessageBubble'
 import QueryInput, { type RoutingMode } from './components/QueryInput'
 import NodeDetailPanel from './components/NodeDetailPanel'
 import UploadModal from './components/UploadModal'
+import PaperView from './components/PaperView'
+import QuizPanel from './components/QuizPanel'
 import { useTheme } from './ThemeContext'
 
+type View = 'chat' | 'paper' | 'quiz'
+
 const EMPTY_GRAPH: GraphData = { nodes: [], edges: [] }
-const API_BASE = import.meta.env.VITE_API_URL ?? '';
+const API_BASE = import.meta.env.VITE_API_URL ?? ''
+const INGEST_JOB_KEY = 'lumin-ingest-job'
 
 
 
@@ -55,9 +60,14 @@ export default function App() {
   const [wakingUp, setWakingUp] = useState(false)
   const [editMode, setEditMode] = useState(false)
   const [suggestions, setSuggestions] = useState<string[]>([])
+  const [view, setView] = useState<View>('chat')
+  const [ingestJob, setIngestJob] = useState<{ id: string; stage: string } | null>(() =>
+    localStorage.getItem(INGEST_JOB_KEY) ? { id: localStorage.getItem(INGEST_JOB_KEY)!, stage: 'Connecting…' } : null
+  )
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const baseGraphRef = useRef<GraphData>(EMPTY_GRAPH)
   const nodeDetailRef = useRef<HTMLDivElement>(null)
+  const ingestPollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const { theme, toggleTheme } = useTheme()
   const isDark = theme === 'dark'
 
@@ -131,6 +141,73 @@ export default function App() {
       loadSuggestions()
     }
   }, [backendReady]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------------
+  // Background ingest-job polling — persisted via localStorage so it survives
+  // tab closes and modal unmounts.
+  // ---------------------------------------------------------------------------
+
+  const startPolling = (jobId: string) => {
+    fetch(`${API_BASE}/api/ingest/jobs/${jobId}`)
+      .then((res) => {
+        if (res.status === 404) {
+          // Backend restarted — job gone; silently clear
+          localStorage.removeItem(INGEST_JOB_KEY)
+          setIngestJob(null)
+          return null
+        }
+        return res.ok ? res.json() : Promise.reject(new Error(`${res.status}`))
+      })
+      .then((job) => {
+        if (!job) return
+        if (job.status === 'done') {
+          localStorage.removeItem(INGEST_JOB_KEY)
+          setIngestJob(null)
+          loadGraph()
+          loadSuggestions()
+        } else if (job.status === 'failed') {
+          localStorage.removeItem(INGEST_JOB_KEY)
+          setIngestJob({ id: jobId, stage: `Failed: ${job.error ?? 'unknown error'}` })
+          ingestPollRef.current = setTimeout(() => setIngestJob(null), 8000)
+        } else {
+          setIngestJob({ id: jobId, stage: job.progress_stage || 'Processing…' })
+          ingestPollRef.current = setTimeout(() => startPolling(jobId), 3000)
+        }
+      })
+      .catch(() => {
+        // Network hiccup — retry
+        ingestPollRef.current = setTimeout(() => startPolling(jobId), 5000)
+      })
+  }
+
+  // Resume polling on mount if a job was in-flight when the tab was closed
+  useEffect(() => {
+    const saved = localStorage.getItem(INGEST_JOB_KEY)
+    if (saved) startPolling(saved)
+    return () => { if (ingestPollRef.current) clearTimeout(ingestPollRef.current) }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Multi-tab sync: if another tab finishes/clears the job, stop polling here too
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key === INGEST_JOB_KEY && e.newValue === null) {
+        if (ingestPollRef.current) clearTimeout(ingestPollRef.current)
+        setIngestJob(null)
+        loadGraph()
+        loadSuggestions()
+      }
+    }
+    window.addEventListener('storage', handler)
+    return () => window.removeEventListener('storage', handler)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleJobStarted = (jobId: string) => {
+    if (ingestPollRef.current) clearTimeout(ingestPollRef.current)
+    localStorage.setItem(INGEST_JOB_KEY, jobId)
+    setIngestJob({ id: jobId, stage: 'Queued…' })
+    setUploadOpen(false)
+    startPolling(jobId)
+  }
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -348,10 +425,6 @@ export default function App() {
     }
   }
 
-  // Evidence for the selected node — fetched from /api/graph/node/{id}
-  // (not derived from the last query, so it works for any clicked node).
-  const nodeEvidence = selectedNodeEvidence
-
   return (
     <div className={`flex h-screen overflow-hidden transition-colors duration-200 ${
       isDark ? 'bg-slate-950 text-slate-200' : 'bg-[#f0f4ff] text-slate-800'
@@ -359,8 +432,8 @@ export default function App() {
       {/* Sidebar — Graph Panel */}
       <aside
         className={`flex flex-col overflow-hidden ${
-          isDark ? 'bg-slate-900' : 'bg-[#f8faff]'
-        } ${fullscreen
+          view === 'paper' || view === 'quiz' ? 'hidden' : ''
+        } ${isDark ? 'bg-slate-900' : 'bg-[#f8faff]'} ${fullscreen
           ? `fixed inset-0 z-50 w-screen ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'}`
           : `border-r transition-all duration-300 shrink-0 ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'} ${
               sidebarOpen ? (maximized ? 'w-[55vw]' : 'w-80 xl:w-96') : 'w-0'
@@ -411,7 +484,7 @@ export default function App() {
               node={selectedNode}
               edges={graph.edges}
               allNodes={graph.nodes}
-              evidence={nodeEvidence}
+              evidence={selectedNodeEvidence}
               evidenceLoading={selectedNodeLoading}
               apiBase={API_BASE}
               onClose={() => setSelectedNode(null)}
@@ -433,18 +506,20 @@ export default function App() {
             ? 'border-slate-800 bg-slate-900/60'
             : 'border-[#dde5f5] bg-white/80'
         }`}>
-          <button
-            onClick={() => setSidebarOpen((v) => !v)}
-            className={`transition-colors p-1 rounded ${
-              isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'
-            }`}
-            title={sidebarOpen ? 'Hide graph' : 'Show graph'}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5">
-              <rect x="3" y="3" width="7" height="18" rx="1" />
-              <path d="M14 3h7M14 12h7M14 21h7" strokeLinecap="round" />
-            </svg>
-          </button>
+          {view === 'chat' && (
+            <button
+              onClick={() => setSidebarOpen((v) => !v)}
+              className={`transition-colors p-1 rounded ${
+                isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'
+              }`}
+              title={sidebarOpen ? 'Hide graph' : 'Show graph'}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5">
+                <rect x="3" y="3" width="7" height="18" rx="1" />
+                <path d="M14 3h7M14 12h7M14 21h7" strokeLinecap="round" />
+              </svg>
+            </button>
+          )}
 
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold">
@@ -456,12 +531,61 @@ export default function App() {
             </div>
           </div>
 
+          <nav className={`ml-4 flex items-center gap-1 rounded-lg border p-0.5 ${
+            isDark ? 'border-slate-700 bg-slate-800/40' : 'border-slate-300 bg-white'
+          }`}>
+            <button
+              onClick={() => setView('chat')}
+              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
+                view === 'chat'
+                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
+                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
+              }`}
+            >
+              Chat
+            </button>
+            <button
+              onClick={() => setView('paper')}
+              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
+                view === 'paper'
+                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
+                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
+              }`}
+            >
+              Paper
+            </button>
+            <button
+              onClick={() => setView('quiz')}
+              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
+                view === 'quiz'
+                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
+                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
+              }`}
+            >
+              Quiz
+            </button>
+          </nav>
+
           <div className="ml-auto flex items-center gap-2">
-            <span className={`text-xs ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
-              {graph.nodes.filter((n) => n.highlighted).length > 0
-                ? `${graph.nodes.filter((n) => n.highlighted).length} nodes highlighted`
-                : 'No active trace'}
-            </span>
+            {ingestJob && (
+              <span className={`text-xs flex items-center gap-1.5 ${
+                ingestJob.stage.startsWith('Failed')
+                  ? (isDark ? 'text-red-400' : 'text-red-500')
+                  : (isDark ? 'text-indigo-400' : 'text-indigo-600')
+              }`}>
+                {!ingestJob.stage.startsWith('Failed') && (
+                  <div className={`w-3 h-3 border border-t-indigo-400 rounded-full animate-spin ${isDark ? 'border-slate-600' : 'border-slate-300'}`} />
+                )}
+                {ingestJob.stage}
+              </span>
+            )}
+            {view === 'chat' && !ingestJob && (
+              <span className={`text-xs ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
+                {graph.nodes.filter((n) => n.highlighted).length > 0
+                  ? `${graph.nodes.filter((n) => n.highlighted).length} nodes highlighted`
+                  : 'No active trace'}
+              </span>
+            )}
 
             {/* Theme toggle */}
             <button
@@ -487,6 +611,7 @@ export default function App() {
               )}
             </button>
 
+            {view === 'chat' && (<>
             <button
               onClick={handleClearData}
               disabled={clearing}
@@ -533,9 +658,16 @@ export default function App() {
             >
               Clear
             </button>
+            </>)}
           </div>
         </header>
 
+        {view === 'paper' ? (
+          <PaperView />
+        ) : view === 'quiz' ? (
+          <QuizPanel isDark={isDark} />
+        ) : (
+        <>
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">
           {messages.length === 0 && (
@@ -602,12 +734,14 @@ export default function App() {
             <QueryInput onSubmit={handleQuery} loading={loading} onFirstKeystroke={handleFirstKeystroke} suggestions={suggestions} />
           </div>
         </div>
+        </>
+        )}
       </main>
 
       {uploadOpen && (
         <UploadModal
           onClose={() => setUploadOpen(false)}
-          onSuccess={() => { loadGraph(); loadSuggestions() }}
+          onJobStarted={handleJobStarted}
         />
       )}
 

@@ -100,6 +100,8 @@ export default function GraphPanel({
   const addNodeInputRef = useRef<HTMLInputElement>(null)
   const [collapsedTopics, setCollapsedTopics] = useState<Set<string>>(new Set())
   const [spacing, setSpacing] = useState(1) // 0.3–3× multiplier for layout spread
+  // Layout-effect keys off this; slider commits to it on release so drag doesn't trigger relayouts.
+  const [committedSpacing, setCommittedSpacing] = useState(1)
   const [neighborMode, setNeighborMode] = useState(false)
 
   const cyFullRef = useRef<cytoscape.Core | null>(null)
@@ -108,6 +110,12 @@ export default function GraphPanel({
   // Deferred-layout flags: set when layout is skipped due to hidden container
   const fullNeedsLayoutRef = useRef(false)
   const subNeedsLayoutRef  = useRef(false)
+
+  // Warm-start flags: once a cy instance has been laid out, re-layouts start
+  // from current node positions (randomize=false) and converge in far fewer
+  // iterations than a cold spectral init.
+  const fullHasLaidOutRef = useRef(false)
+  const subHasLaidOutRef  = useRef(false)
 
   // -----------------------------------------------------------------------
   // "Latest state" ref — Cytoscape event handlers read current React state
@@ -468,14 +476,21 @@ export default function GraphPanel({
       return
     }
 
-    const s = spacing // multiplier from slider (0.3–3)
+    const s = committedSpacing // multiplier from slider (0.3–3); only updates on release
     const nodeCount = cy.nodes().length
+
+    // Warm-start: once the instance has been laid out, start from current
+    // positions rather than a fresh spectral init. Converges in far fewer
+    // iterations without the up-front cost of randomization.
+    const hasLaidOutRef = cy === cyFullRef.current ? fullHasLaidOutRef : subHasLaidOutRef
+    const warmStart = hasLaidOutRef.current
 
     // Adaptive layout params — repulsion and edge length must exceed node
     // dimensions (90×36) to prevent overlap.  Spacing multiplier scales
     // repulsion / edge length / separation while inversely scaling gravity.
     const opts: Record<string, unknown> = {
       ...LAYOUT_BASE,
+      randomize: !warmStart,
       tilingPaddingVertical:   Math.round(150 * s),
       tilingPaddingHorizontal: Math.round(150 * s),
     }
@@ -484,22 +499,23 @@ export default function GraphPanel({
       opts.nodeRepulsion = 500000 * s * s
       opts.idealEdgeLength = Math.round(800 * s)
       opts.nodeSeparation = Math.round(400 * s)
-      opts.numIter = 4000
+      opts.numIter = warmStart ? 400 : 1500
     } else if (nodeCount > 50) {
       opts.gravity = 0.01 / s
       opts.nodeRepulsion = 400000 * s * s
       opts.idealEdgeLength = Math.round(700 * s)
       opts.nodeSeparation = Math.round(350 * s)
-      opts.numIter = 4000
+      opts.numIter = warmStart ? 250 : 800
     } else {
       opts.gravity = 0.005 / s
       opts.nodeRepulsion = 300000 * s * s
       opts.idealEdgeLength = Math.round(600 * s)
       opts.nodeSeparation = Math.round(300 * s)
-      opts.numIter = 4000
+      opts.numIter = warmStart ? 150 : 400
     }
 
     cy.layout(opts as any).run()
+    hasLaidOutRef.current = true
 
     // Fit all nodes into view, then clamp zoom so labels stay readable.
     // For large graphs this means the user sees a portion and can pan around.
@@ -511,16 +527,16 @@ export default function GraphPanel({
       })
       cy.center()
     }
-  }, [spacing])
+  }, [committedSpacing])
 
-  // Re-run layout when spacing slider changes
-  const prevSpacingRef = useRef(spacing)
+  // Re-run layout when spacing slider is released (committed), not on every drag tick.
+  const prevSpacingRef = useRef(committedSpacing)
   useEffect(() => {
-    if (prevSpacingRef.current === spacing) return
-    prevSpacingRef.current = spacing
+    if (prevSpacingRef.current === committedSpacing) return
+    prevSpacingRef.current = committedSpacing
     const cy = activeTab === 'full' ? cyFullRef.current : cySubRef.current
     if (cy) runLayout(cy, true)
-  }, [spacing, activeTab, runLayout])
+  }, [committedSpacing, activeTab, runLayout])
 
   // Trigger layout when full-graph topology changes.
   useEffect(() => {
@@ -584,8 +600,14 @@ export default function GraphPanel({
     })
   }, [toggleCollapse]) // toggleCollapse is stable (no deps)
 
-  // Resize + deferred layout when tab becomes visible (hidden div has 0 dimensions)
+  // Resize + deferred layout when tab becomes visible (hidden div has 0 dimensions).
+  // Guarded by prevActiveTabRef so this only fires on a real tab change, not
+  // whenever runLayout's identity updates (e.g. committedSpacing change).
+  const prevActiveTabRef = useRef<Tab>('full')
   useEffect(() => {
+    if (prevActiveTabRef.current === activeTab) return
+    prevActiveTabRef.current = activeTab
+
     const cy = activeTab === 'full' ? cyFullRef.current : cySubRef.current
     const needsRef = activeTab === 'full' ? fullNeedsLayoutRef : subNeedsLayoutRef
     if (!cy) return
@@ -594,9 +616,9 @@ export default function GraphPanel({
       if (needsRef.current) {
         needsRef.current = false
         runLayout(cy, true) // force=true bypasses the dimension check
-      } else {
-        cy.fit(undefined, 30)
       }
+      // Skip cy.fit() when no layout is needed — viewport was already fit
+      // when the tab was last visible and resize() alone doesn't change it.
     }, 50)
     return () => clearTimeout(t)
   }, [activeTab, runLayout])
@@ -678,6 +700,36 @@ export default function GraphPanel({
   const zoomOut  = () => { const cy = activeCy(); cy?.zoom({ level: cy.zoom() * 0.8,  renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } }) }
   const resetZoom = () => activeCy()?.fit(undefined, 30)
 
+  const captureGraph = () => {
+    const cy = activeCy()
+    if (!cy || cy.nodes().length === 0) return
+
+    // Temporarily apply a print-friendly stylesheet: black text, bold, bigger
+    // nodes, light palette — always readable on a white background regardless
+    // of the current UI theme. Both cy.style() and cy.png() are synchronous so
+    // the user never sees the style swap.
+    const printStylesheet = [
+      ...stylesheet,
+      { selector: 'node',           style: { color: '#000000', 'font-weight': 'bold', 'font-size': 12, width: 126, height: 50, 'text-max-width': '108px', 'background-color': '#f8faff', 'border-color': '#94a3b8' } },
+      { selector: 'node.topic',     style: { 'background-color': '#e0e7ff', 'border-color': '#4f46e5', color: '#000000', 'font-weight': 'bold', width: 154, height: 62, 'font-size': 14 } },
+      { selector: 'node.subtopic',  style: { 'background-color': '#faf5ff', 'border-color': '#a855f7', color: '#000000', width: 140, height: 56 } },
+      { selector: 'node.content',   style: { 'background-color': '#ccfbf1', 'border-color': '#0d9488', color: '#000000', width: 119, height: 45, 'font-size': 11 } },
+      { selector: 'node.highlighted', style: { 'background-color': '#6366f1', 'border-color': '#4338ca', color: '#ffffff' } },
+      { selector: 'node.selected',  style: { 'border-color': '#d97706', 'border-width': 3 } },
+      { selector: 'edge',           style: { 'line-color': '#94a3b8', 'target-arrow-color': '#94a3b8', color: '#374151', opacity: 1 } },
+      { selector: 'edge.highlighted', style: { 'line-color': '#6366f1', 'target-arrow-color': '#6366f1', color: '#4f46e5' } },
+    ]
+
+    cy.style(printStylesheet as any)
+    const dataUrl = cy.png({ full: true, scale: 2, output: 'base64uri', bg: '#ffffff' })
+    cy.style(stylesheet as any)
+
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = `${activeTab}-graph.png`
+    a.click()
+  }
+
   // -----------------------------------------------------------------------
   // Derived display values
   // -----------------------------------------------------------------------
@@ -734,6 +786,12 @@ export default function GraphPanel({
             </svg>
           </button>
           <button onClick={zoomIn}    className={btnCls} title="Zoom in"><span className="text-sm font-mono leading-none">+</span></button>
+          <button onClick={captureGraph} className={btnCls} title="Save graph as PNG">
+            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+              <path d="M2 4.5A1.5 1.5 0 013.5 3h.879l.707-1h3.828l.707 1H10.5A1.5 1.5 0 0112 4.5v6A1.5 1.5 0 0110.5 12h-7A1.5 1.5 0 012 10.5v-6z" strokeLinejoin="round"/>
+              <circle cx="7" cy="7.5" r="1.75"/>
+            </svg>
+          </button>
 
           <div className={`w-px h-4 mx-0.5 ${isDark ? 'bg-slate-700' : 'bg-slate-200'}`} />
 
@@ -750,6 +808,8 @@ export default function GraphPanel({
               step="0.1"
               value={spacing}
               onChange={(e) => setSpacing(parseFloat(e.target.value))}
+              onPointerUp={(e) => setCommittedSpacing(parseFloat((e.target as HTMLInputElement).value))}
+              onKeyUp={(e) => setCommittedSpacing(parseFloat((e.target as HTMLInputElement).value))}
               className="w-16 h-1 accent-indigo-500 cursor-pointer"
             />
             <span className={`text-[10px] tabular-nums w-7 text-right ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
@@ -932,21 +992,25 @@ export default function GraphPanel({
 
       {/* Canvas */}
       <div className="flex-1 overflow-hidden px-2 relative">
-        {activeTab === 'subgraph' && subgraphNodeCount === 0 ? (
-          <div className={`flex flex-col items-center justify-center h-full text-xs text-center px-6 gap-2 ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-8 h-8" style={{ color: isDark ? '#334155' : '#c7d2fe' }}>
-              <circle cx="5" cy="12" r="2" /><circle cx="19" cy="6" r="2" /><circle cx="19" cy="18" r="2" />
-              <path d="M7 11.5l10-4M7 12.5l10 4" strokeLinecap="round" />
-            </svg>
-            No retrieval trace yet.<br />Ask a question to see the extracted subgraph.
-          </div>
-        ) : filteredNodes.length === 0 && activeTab === 'full' && !editMode ? (
+        {filteredNodes.length === 0 && !editMode ? (
           <div className={`flex items-center justify-center h-full text-xs text-center px-4 ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
             No graph loaded.<br />Run the ingestion pipeline to populate the concept graph.
           </div>
         ) : (
           <>
-            {activeTab === 'subgraph' && (
+            {/* Empty subgraph overlay — absolute so it floats above the hidden canvas
+                without unmounting CytoscapeComponent (which triggers an expensive cold remount). */}
+            {activeTab === 'subgraph' && subgraphNodeCount === 0 && (
+              <div className={`absolute inset-0 flex flex-col items-center justify-center text-xs text-center px-6 gap-2 z-10 pointer-events-none ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-8 h-8" style={{ color: isDark ? '#334155' : '#c7d2fe' }}>
+                  <circle cx="5" cy="12" r="2" /><circle cx="19" cy="6" r="2" /><circle cx="19" cy="18" r="2" />
+                  <path d="M7 11.5l10-4M7 12.5l10 4" strokeLinecap="round" />
+                </svg>
+                No retrieval trace yet.<br />Ask a question to see the extracted subgraph.
+              </div>
+            )}
+
+            {activeTab === 'subgraph' && subgraphNodeCount > 0 && (
               <div className={`flex items-center gap-3 px-2 py-1 text-xs shrink-0 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
                 <span><span className="font-medium" style={{ color: isDark ? '#818cf8' : '#6366f1' }}>{subgraphNodeCount}</span> nodes</span>
                 <span><span className="font-medium" style={{ color: isDark ? '#818cf8' : '#6366f1' }}>{subEdgeCount}</span> edges</span>

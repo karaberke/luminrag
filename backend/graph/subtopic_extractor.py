@@ -19,7 +19,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
-from backend.graph._llm import safe_call_json
+from backend.graph._llm import resolve_synonym, safe_call_json
 from backend.graph.schema import SubtopicProposal, make_key
 from backend.schemas import Chunk
 
@@ -67,26 +67,6 @@ Example: [{{"name":"Shortest Paths","summary":"Algorithms for finding minimum-we
 _MAX_TEXT_CHARS = 1800
 
 
-def _resolve_synonym(
-    proposed_name: str,
-    existing_names: list[str],
-    embedder: "Embedder | None",
-    threshold: float,
-) -> str:
-    if not existing_names or embedder is None:
-        return proposed_name
-    try:
-        candidate = embedder.embed_one(proposed_name)
-        pool = embedder.embed(existing_names)
-        sims = pool @ candidate
-        best_idx = int(sims.argmax())
-        if float(sims[best_idx]) >= threshold:
-            return existing_names[best_idx]
-    except Exception as exc:
-        logger.debug(f"Embedding-based synonym lookup failed: {exc}")
-    return proposed_name
-
-
 def _extract_for_chunk(
     chunk: Chunk,
     topic_names: list[str],
@@ -118,7 +98,7 @@ def _extract_for_chunk(
             logger.debug(f"Skipping malformed subtopic entry: {entry}")
             continue
 
-        name = _resolve_synonym(name, existing_names, embedder, threshold)
+        name = resolve_synonym(name, existing_names, embedder, threshold)
         proposals.append(
             SubtopicProposal(
                 name=name,
