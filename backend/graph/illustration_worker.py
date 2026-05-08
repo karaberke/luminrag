@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,6 +47,45 @@ def illustrations_dir(processed_dir: Path) -> Path:
 # Equation renderer
 # ---------------------------------------------------------------------------
 
+def _clean_latex_hint(hint: str) -> str:
+    """
+    Normalise an LLM-emitted LaTeX hint before passing it to matplotlib mathtext.
+
+    Problems addressed:
+    - JSON-mangled backslashes: json.loads() turns \\theta → tab+"heta" (chr 9),
+      \\frac → form-feed+"rac" (chr 12), \\boldsymbol → backspace+"oldsymbol" (chr 8).
+    - Double-backslash commands: \\cos → \cos (LLM double-escaped in JSON).
+    - Python-style Unicode escapes: Λ → actual character (e.g. Λ).
+    - \textbf → \mathbf (matplotlib uses math-mode bold, not text-mode bold).
+    - Outer delimiter mismatch: strip \\[...\\], \[...\], \(...\), $$...$$.
+    """
+    s = hint.strip()
+    # Restore control characters introduced by JSON parsing of bare-backslash LaTeX
+    s = (s
+         .replace('\x08', r'\b')   # \b (backspace)  → e.g. \boldsymbol
+         .replace('\x09', r'\t')   # \t (tab)          → e.g. \theta, \text
+         .replace('\x0c', r'\f')   # \f (form feed)   → e.g. \frac
+         .replace('\x0d', r'\r')   # \r (CR)           → e.g. \rho
+    )
+    # Collapse double-backslash commands (\\cos → \cos) from JSON double-escaping
+    s = re.sub(r'\\\\([a-zA-Z])', r'\\\1', s)
+    # Decode Python-style Unicode escapes left as literal text (Λ → Λ)
+    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
+    # matplotlib uses \mathbf, not \textbf
+    s = s.replace(r'\textbf', r'\mathbf')
+    # Strip outer display/inline-math delimiters not understood by mathtext
+    for pat in (
+        r'^\s*\\\\\[(.*)\\\\\]\s*$',  # \\[...\\]
+        r'^\s*\\\[(.*)\\\]\s*$',       # \[...\]
+        r'^\s*\\\((.*)\\\)\s*$',       # \(...\)
+        r'^\s*\$\$(.*)\$\$\s*$',       # $$...$$
+    ):
+        m = re.match(pat, s, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+    return s.strip('$')
+
+
 def _render_equation(hint: str, out_path: Path, dpi: int = 150) -> bool:
     """
     Render a LaTeX hint to a PNG using matplotlib.mathtext.
@@ -56,7 +97,7 @@ def _render_equation(hint: str, out_path: Path, dpi: int = 150) -> bool:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    latex = hint.strip().strip("$")
+    latex = _clean_latex_hint(hint)
     fig, ax = plt.subplots(figsize=(7, 1.8))
     ax.text(
         0.5, 0.5,
@@ -110,6 +151,9 @@ def _find_source_image(
         for p in chunk.metadata.get("image_paths", []):
             if Path(p).exists():
                 return p
+        source_file = chunk.metadata.get("source_file")
+        if source_file and Path(source_file).exists():
+            return source_file
     return None
 
 
@@ -145,7 +189,14 @@ async def resolve_illustration(
 
     if kind in ("diagram", "image"):
         src = _find_source_image(node_key, builder, doc_store)
-        return Path(src) if src else None
+        if not src:
+            return None
+        src_path = Path(src)
+        safe = node_key.replace(":", "_").replace("/", "_")
+        out_path = output_dir / f"{safe}{src_path.suffix}"
+        if not out_path.exists():
+            shutil.copy2(src_path, out_path)
+        return out_path
 
     # kind == "code" or any unrecognised kind — no illustration
     return None

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from backend.graph._llm import safe_call_json
+from backend.graph._llm import resolve_synonym, safe_call_json
 from backend.graph.schema import TopicProposal
 
 if TYPE_CHECKING:
@@ -71,27 +71,6 @@ def _max_topics_for_length(preview_len: int) -> int:
     return 3
 
 
-def _resolve_synonym(
-    proposed_name: str,
-    existing_names: list[str],
-    embedder: "Embedder | None",
-    threshold: float,
-) -> str:
-    """Swap the proposed name for the nearest existing name if similar enough."""
-    if not existing_names or embedder is None:
-        return proposed_name
-    try:
-        candidate = embedder.embed_one(proposed_name)
-        pool = embedder.embed(existing_names)
-        sims = pool @ candidate  # both L2-normalised
-        best_idx = int(sims.argmax())
-        if float(sims[best_idx]) >= threshold:
-            return existing_names[best_idx]
-    except Exception as exc:
-        logger.debug(f"Embedding-based synonym lookup failed: {exc}")
-    return proposed_name
-
-
 def extract_topics(
     doc_preview: str,
     source_chunk_ids: list[str],
@@ -135,7 +114,7 @@ def extract_topics(
             logger.debug(f"Skipping malformed topic entry: {entry}")
             continue
 
-        name = _resolve_synonym(name, existing_names or [], embedder, threshold)
+        name = resolve_synonym(name, existing_names or [], embedder, threshold)
         proposals.append(
             TopicProposal(
                 name=name,

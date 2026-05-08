@@ -14,13 +14,12 @@ Public API:
 from __future__ import annotations
 
 import itertools
-import json
 import logging
 from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
 
-from backend.graph._llm import call_llm, parse_json_list
+from backend.graph._llm import safe_call_json
 from backend.graph.schema import RelatedToProposal
 
 if TYPE_CHECKING:
@@ -131,15 +130,7 @@ def link_nodes(
         # Re-index batch 0..len(batch)-1 so the LLM indices map cleanly.
         indexed = [(i, a, b) for i, (_, a, b, _) in enumerate(batch)]
         prompt = _PROMPT.format(pairs_block=_build_pairs_block(indexed))
-        try:
-            raw = call_llm(prompt, cfg, max_tokens=cfg.get("max_tokens", 512))
-        except Exception as exc:
-            logger.warning(f"Semantic linker LLM call failed on batch: {exc}")
-            continue
-        try:
-            parsed = parse_json_list(raw)
-        except json.JSONDecodeError:
-            parsed = []
+        parsed = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 512))
 
         for entry in parsed:
             try:

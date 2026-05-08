@@ -13,8 +13,11 @@ Switch provider with one line in config/llm.yaml:
 from __future__ import annotations
 
 import base64
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 _CAPTION_PROMPT = (
@@ -114,3 +117,17 @@ def build_captioner(cfg: dict) -> BaseCaptioner:
     raise ValueError(
         f"Unknown captioning provider: '{provider}'. Use 'ollama' or 'anthropic'."
     )
+
+
+def safe_caption(captioner: BaseCaptioner, image_path: Path, label: str) -> str:
+    """
+    Call ``captioner.caption(image_path)`` and swallow any exception into a
+    warning log, returning ``""`` on failure. *label* is inserted into the
+    log message so callers can identify the source (e.g. a source_id +
+    page number, or a keyframe path).
+    """
+    try:
+        return captioner.caption(image_path)
+    except Exception as exc:
+        logger.warning(f"Captioning failed ({label}): {exc}")
+        return ""

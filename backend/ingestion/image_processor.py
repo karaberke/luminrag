@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from backend.ingestion.captioners import build_captioner
+from backend.ingestion.captioners import build_captioner, safe_caption
 from backend.schemas import Chunk
 
 logger = logging.getLogger(__name__)
@@ -74,11 +74,7 @@ def process_image(image_path: str | Path, config: dict) -> list[Chunk]:
 
     width, height = _get_dimensions(image_path)
 
-    caption = ""
-    try:
-        caption = captioner.caption(image_path)
-    except Exception as exc:
-        logger.warning(f"[{source_id}] Captioning failed: {exc}")
+    caption = safe_caption(captioner, image_path, source_id)
 
     text = caption if caption else f"[Image: {image_path.name}]"
 

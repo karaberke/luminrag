@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { GraphNode, GraphEdge, EvidenceChunk } from '../types'
 import { useTheme } from '../ThemeContext'
 import { RichText } from './RichText'
+import { sourceUrl } from '../utils/source'
 
 interface Props {
   node: GraphNode
@@ -21,35 +22,6 @@ const CONTENT_TYPES = ['definition', 'theorem', 'technique', 'example', 'questio
 
 function edgeLabel(e: GraphEdge): string {
   return e.relation === 'RELATED_TO' && e.label ? e.label : e.relation
-}
-
-/** Parse "MM:SS" or "HH:MM:SS" → seconds. Returns null if unrecognised. */
-function parseTimestamp(ts: string | undefined): number | null {
-  if (!ts) return null
-  const parts = ts.split(':').map((p) => parseInt(p, 10))
-  if (parts.some(Number.isNaN)) return null
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  return null
-}
-
-/** Build a deep-linking URL for a source file: #page=N for PDFs, #t=SSs for AV. */
-function sourceUrl(
-  apiBase: string,
-  source: string,
-  modality: string,
-  page: number | undefined,
-  timestamp: string | undefined,
-): string {
-  const base = `${apiBase}/api/source/${encodeURIComponent(source)}`
-  if ((modality === 'pdf' || modality === 'slide') && page != null) {
-    return `${base}#page=${page}`
-  }
-  if (modality === 'video' || modality === 'audio') {
-    const secs = parseTimestamp(timestamp)
-    if (secs != null) return `${base}#t=${secs}`
-  }
-  return base
 }
 
 /** Group evidence chunks by source_id so a paper with 5 cited pages shows up once. */
@@ -439,7 +411,7 @@ export default function NodeDetailPanel({
         </div>
       )}
 
-      {/* Illustration — collapsible; rendered image if available, else pending badge, else hint */}
+      {/* Illustration — collapsible; image if resolved, KaTeX for equations, pending badge for others */}
       {(illustrationSrc || node.illustration) && (
         <div className="mb-4">
           <button
@@ -450,7 +422,7 @@ export default function NodeDetailPanel({
           >
             <span>{illustrationOpen ? '▼' : '▶'}</span>
             Illustration{node.illustration ? ` · ${node.illustration.kind}` : ''}
-            {!illustrationSrc && node.illustration && (
+            {!illustrationSrc && node.illustration && node.illustration.kind !== 'equation' && (
               <span className={`ml-1 text-[9px] px-1.5 py-0.5 rounded-full border ${
                 isDark ? 'bg-amber-950 text-amber-400 border-amber-800' : 'bg-amber-50 text-amber-700 border-amber-200'
               }`}>pending</span>
@@ -464,6 +436,10 @@ export default function NodeDetailPanel({
                 className={`rounded border w-full ${isDark ? 'border-slate-700' : 'border-slate-200'}`}
                 loading="lazy"
               />
+            ) : node.illustration?.kind === 'equation' && node.illustration.hint ? (
+              <div className={`rounded border p-3 ${isDark ? 'border-slate-700 bg-slate-800/50' : 'border-slate-200 bg-slate-50'}`}>
+                <RichText text={node.illustration.hint} />
+              </div>
             ) : node.illustration ? (
               <p className={`text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>{node.illustration.hint}</p>
             ) : null

@@ -19,7 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from backend.retrieval.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -118,3 +121,29 @@ def safe_call_json(prompt: str, cfg: dict, *, max_tokens: int | None = None) -> 
         logger.warning(f"LLM call failed: {exc}")
         return []
     return parse_json_list(raw)
+
+
+def resolve_synonym(
+    proposed: str,
+    existing: list[str],
+    embedder: "Embedder | None",
+    threshold: float,
+) -> str:
+    """
+    Swap *proposed* for the nearest existing name if cosine similarity
+    (L2-normalised dot product) meets *threshold*; otherwise return
+    *proposed* unchanged. Used by Stage 1.2–1.4 extractors to converge
+    synonyms to a single graph key.
+    """
+    if not existing or embedder is None:
+        return proposed
+    try:
+        candidate = embedder.embed_one(proposed)
+        pool = embedder.embed(existing)
+        sims = pool @ candidate
+        best_idx = int(sims.argmax())
+        if float(sims[best_idx]) >= threshold:
+            return existing[best_idx]
+    except Exception as exc:
+        logger.debug(f"Embedding-based synonym lookup failed: {exc}")
+    return proposed

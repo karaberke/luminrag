@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from backend.graph._llm import safe_call_json
+from backend.graph._llm import resolve_synonym, safe_call_json
 from backend.graph.schema import ContentProposal, Illustration
 from backend.schemas import Chunk
 
@@ -64,7 +64,11 @@ Return ONLY a JSON array. Each element must have keys:
                         names central to this unit (plain strings, no explanations)
   "parent_subtopic"   : best subtopic from the list above (or "")
   "illustration_kind" : diagram | equation | code | image | "" if none
-  "illustration_hint" : 1-line description of what the illustration would show, or ""
+  "illustration_hint" : For illustration_kind=equation: copy the verbatim LaTeX
+                        expression from the chunk (e.g. "$F = ma$" or
+                        "$$\\int_0^\\infty e^{{-x}}\\,dx = 1$$"). For all other
+                        kinds: a 1-line description of what the illustration
+                        would show. Leave "" if no illustration.
 
 Return [] if the chunk has no discrete teachable units.\
 """
@@ -108,26 +112,6 @@ def _parse_key_terms(raw) -> list[str]:
     return out
 
 
-def _resolve_synonym(
-    proposed_title: str,
-    existing_titles: list[str],
-    embedder: "Embedder | None",
-    threshold: float,
-) -> str:
-    if not existing_titles or embedder is None:
-        return proposed_title
-    try:
-        candidate = embedder.embed_one(proposed_title)
-        pool = embedder.embed(existing_titles)
-        sims = pool @ candidate
-        best_idx = int(sims.argmax())
-        if float(sims[best_idx]) >= threshold:
-            return existing_titles[best_idx]
-    except Exception as exc:
-        logger.debug(f"Embedding-based synonym lookup failed: {exc}")
-    return proposed_title
-
-
 def _illustration_from(entry: dict) -> Illustration | None:
     kind = str(entry.get("illustration_kind", "")).strip().lower()
     hint = str(entry.get("illustration_hint", "")).strip()
@@ -167,10 +151,13 @@ def synthesize_contents(
     if not chunk.text.strip():
         return []
 
+    def _esc(s: str) -> str:
+        return s.replace("{", "{{").replace("}", "}}")
+
     prompt = _PROMPT.format(
-        topics=", ".join(topic_names) if topic_names else "(none)",
-        subtopics=", ".join(subtopic_names) if subtopic_names else "(none)",
-        text=chunk.text[:_MAX_TEXT_CHARS],
+        topics=_esc(", ".join(topic_names) if topic_names else "(none)"),
+        subtopics=_esc(", ".join(subtopic_names) if subtopic_names else "(none)"),
+        text=_esc(chunk.text[:_MAX_TEXT_CHARS]),
         max_per_chunk=max_per_chunk,
     )
     raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2000))
@@ -194,7 +181,7 @@ def synthesize_contents(
             logger.debug(f"Skipping malformed content entry: {entry}")
             continue
 
-        title = _resolve_synonym(title, existing_titles or [], embedder, threshold)
+        title = resolve_synonym(title, existing_titles or [], embedder, threshold)
 
         proposals.append(
             ContentProposal(

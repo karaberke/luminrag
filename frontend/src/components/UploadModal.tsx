@@ -1,50 +1,28 @@
 import { useRef, useState } from 'react'
 import { useTheme } from '../ThemeContext'
 
-interface IngestResult {
-  files_processed: number
-  chunks_produced: number
-  topics_added: number
-  subtopics_added: number
-  contents_added: number
-  related_edges_added: number
-  graph_nodes: number
-  graph_edges: number
-  failed: string[]
-}
-
 interface UploadModalProps {
   onClose: () => void
-  onSuccess: () => void
+  onJobStarted: (jobId: string) => void
 }
 
-interface IngestJobStatus {
-  job_id: string
-  status: 'queued' | 'running' | 'done' | 'failed'
-  progress_stage: string
-  result: IngestResult | null
-  error: string | null
-}
-
-type UploadStage = 'idle' | 'presigning' | 'uploading' | 'processing' | 'done' | 'error'
+type UploadStage = 'idle' | 'presigning' | 'uploading' | 'starting' | 'done' | 'error'
 
 const ACCEPTED = '.pdf,.mp4,.mkv,.mov,.avi,.mp3,.wav,.m4a,.ogg,.flac,.aac,.wma,.jpg,.jpeg,.png,.webp'
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
 
-export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
+export default function UploadModal({ onClose, onJobStarted }: UploadModalProps) {
   const [files, setFiles] = useState<File[]>([])
   const [slideFiles, setSlideFiles] = useState<Set<string>>(new Set())
   const [stage, setStage] = useState<UploadStage>('idle')
   const [uploadProgress, setUploadProgress] = useState({ done: 0, total: 0 })
-  const [result, setResult] = useState<IngestResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [progressStage, setProgressStage] = useState<string>('')
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
-  const busy = stage !== 'idle' && stage !== 'done' && stage !== 'error'
+  const busy = stage === 'presigning' || stage === 'uploading' || stage === 'starting'
 
   const addFiles = (list: FileList | null) => {
     if (!list) return
@@ -109,8 +87,8 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
         setUploadProgress({ done: i + 1, total: files.length })
       }
 
-      // Step 3 — Kick off ingestion (returns job_id immediately, no timeout risk)
-      setStage('processing')
+      // Step 3 — Kick off ingestion (returns job_id immediately)
+      setStage('starting')
       const ingestRes = await fetch(`${API_BASE}/api/ingest/from-s3`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -125,34 +103,9 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
       }
       const { job_id }: { job_id: string } = await ingestRes.json()
 
-      // Step 4 — Poll until done or failed
-      await new Promise<void>((resolve, reject) => {
-        const poll = async () => {
-          try {
-            const statusRes = await fetch(`${API_BASE}/api/ingest/jobs/${job_id}`)
-            if (!statusRes.ok) {
-              reject(new Error(`Status check failed: ${statusRes.status}`))
-              return
-            }
-            const job: IngestJobStatus = await statusRes.json()
-            setProgressStage(job.progress_stage)
-            if (job.status === 'done' && job.result) {
-              setResult(job.result)
-              resolve()
-            } else if (job.status === 'failed') {
-              reject(new Error(job.error ?? 'Ingestion failed'))
-            } else {
-              setTimeout(poll, 3000)
-            }
-          } catch (e) {
-            reject(e)
-          }
-        }
-        setTimeout(poll, 3000)
-      })
-
+      // Hand off to App — App owns all polling from here
       setStage('done')
-      onSuccess()
+      setTimeout(() => onJobStarted(job_id), 1500)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setStage('error')
@@ -163,22 +116,10 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
     switch (stage) {
       case 'presigning': return 'Preparing upload…'
       case 'uploading':  return `Uploading ${uploadProgress.done} of ${uploadProgress.total} file${uploadProgress.total !== 1 ? 's' : ''}…`
-      case 'processing': return progressStage || 'Queued…'
+      case 'starting':   return 'Starting ingestion…'
       default:           return 'Upload & Ingest'
     }
   }
-
-  const stats: [string, number][] = result
-    ? [
-        ['Files processed', result.files_processed],
-        ['Chunks produced', result.chunks_produced],
-        ['Topics added',    result.topics_added],
-        ['Subtopics added', result.subtopics_added],
-        ['Contents added',  result.contents_added],
-        ['Graph nodes',     result.graph_nodes],
-        ['Graph edges',     result.graph_edges],
-      ]
-    : []
 
   return (
     <div className={`fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm ${
@@ -207,36 +148,15 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
 
         {/* Body */}
         <div className="px-5 py-4 space-y-4">
-          {stage === 'done' && result ? (
-            /* ── Result view ── */
-            <div className="space-y-3">
-              <div className={`flex items-center gap-2 ${isDark ? 'text-green-400' : 'text-green-600'}`}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5 shrink-0">
-                  <path d="M22 11.08V12a10 10 0 11-5.93-9.14" strokeLinecap="round" />
-                  <path d="M22 4L12 14.01l-3-3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <span className="text-sm font-medium">Ingestion complete — graph updated</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                {stats.map(([label, value]) => (
-                  <div key={label} className={`rounded-lg px-3 py-2 ${isDark ? 'bg-slate-800' : 'bg-slate-50'}`}>
-                    <p className={isDark ? 'text-slate-500' : 'text-slate-400'}>{label}</p>
-                    <p className={`font-semibold text-base ${isDark ? 'text-white' : 'text-slate-900'}`}>{value}</p>
-                  </div>
-                ))}
-              </div>
-              {result.failed.length > 0 && (
-                <p className={`text-xs rounded-lg px-3 py-2 border ${
-                  isDark
-                    ? 'text-amber-400 bg-amber-950/30 border-amber-800'
-                    : 'text-amber-700 bg-amber-50 border-amber-300'
-                }`}>
-                  Failed: {result.failed.join(', ')}
-                </p>
-              )}
+          {stage === 'done' ? (
+            <div className={`flex items-center gap-2 ${isDark ? 'text-green-400' : 'text-green-600'}`}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5 shrink-0">
+                <path d="M22 11.08V12a10 10 0 11-5.93-9.14" strokeLinecap="round" />
+                <path d="M22 4L12 14.01l-3-3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span className="text-sm font-medium">Upload complete — ingestion running in background</span>
             </div>
           ) : (
-            /* ── Upload form ── */
             <>
               {/* Drop zone */}
               <div
@@ -311,7 +231,7 @@ export default function UploadModal({ onClose, onSuccess }: UploadModalProps) {
                 </ul>
               )}
 
-              {(stage === 'error') && error && (
+              {stage === 'error' && error && (
                 <p className={`text-xs rounded-lg px-3 py-2 border ${
                   isDark
                     ? 'text-red-400 bg-red-950/40 border-red-800'

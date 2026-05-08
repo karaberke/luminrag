@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
-from backend.ingestion.captioners import BaseCaptioner, build_captioner
+from backend.ingestion.captioners import BaseCaptioner, build_captioner, safe_caption
 from backend.schemas import Chunk
 
 logger = logging.getLogger(__name__)
@@ -180,12 +180,7 @@ def _build_chunks(
         transcript_text = " ".join(s["text"] for s in interval_segs)
 
         kf_path = kf_by_ts.get(interval_start) if interval_start > 0.0 else None
-        caption = ""
-        if kf_path:
-            try:
-                caption = captioner.caption(kf_path)
-            except Exception as exc:
-                logger.warning(f"Captioning failed for {kf_path}: {exc}")
+        caption = safe_caption(captioner, kf_path, str(kf_path)) if kf_path else ""
 
         full_text = f"[Visual: {caption}] {transcript_text}" if caption else transcript_text
 
