@@ -1,5 +1,5 @@
 import type { ReflectionVerdict } from '../types'
-import { useTheme } from '../ThemeContext'
+import { useTheme } from '../theme'
 
 interface Props {
   verdict: ReflectionVerdict

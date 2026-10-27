@@ -19,30 +19,70 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import threading
 
 from backend.schemas import Chunk
+from backend.utils.models import pinned_model_path
 
 logger = logging.getLogger(__name__)
 
 _cross_encoder = None
 _loaded_model_name: str | None = None
+_inference_lock = threading.RLock()
 
-_DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+_DEFAULT_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 
 
 def _get_cross_encoder(model_name: str):
     global _cross_encoder, _loaded_model_name
+    if model_name == "cross-encoder/ms-marco-MiniLM-L-6-v2":
+        model_name = _DEFAULT_MODEL
     if _cross_encoder is None or _loaded_model_name != model_name:
-        from sentence_transformers import CrossEncoder
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
         logger.info(f"Loading cross-encoder '{model_name}' …")
-        _cross_encoder = CrossEncoder(model_name)
+        threads = min(8, max(1, int(os.getenv("LUMIN_MODEL_THREADS", "2"))))
+        _cross_encoder = TextCrossEncoder(model_name=model_name, threads=threads,
+                                         specific_model_path=str(pinned_model_path(model_name)))
         _loaded_model_name = model_name
         logger.info("Cross-encoder ready.")
     return _cross_encoder
 
 
 def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    exp = math.exp(x)
+    return exp / (1.0 + exp)
+
+
+def _cap(items: list, max_sources: int | None) -> list:
+    return items if max_sources is None else items[:max(0, max_sources)]
+
+
+def _degraded(
+    chunks: list[Chunk],
+    exc: Exception,
+    min_relevancy: float,
+    max_sources: int | None,
+) -> list[Chunk]:
+    """
+    Fallback when the cross-encoder is unavailable: keep retrieval order and
+    still enforce max_sources. No relevancy scores exist, so the cutoff is
+    skipped (and reported as such) rather than silently claimed.
+    """
+    capped = _cap(chunks, max_sources)
+    cutoff_note = (
+        f"min_relevancy={min_relevancy:.2f} cutoff NOT applied (no scores)"
+        if min_relevancy > 0.0
+        else "no relevancy cutoff requested"
+    )
+    logger.error(
+        f"Cross-encoder failed ({exc}); degraded mode: returning {len(capped)}/"
+        f"{len(chunks)} chunks in retrieval order, max_sources={max_sources}, "
+        f"{cutoff_note}."
+    )
+    return capped
 
 
 def rerank(
@@ -75,12 +115,16 @@ def rerank(
     model_name = config.get("reranker", {}).get("model", _DEFAULT_MODEL)
 
     try:
-        ce = _get_cross_encoder(model_name)
-        pairs = [(query, c.text) for c in chunks]
-        raw_scores: list[float] = ce.predict(pairs).tolist()
+        # Queries now generate independently of the knowledge-state lock.
+        # Keep lazy loading and mutable model/tokenizer access serialized
+        # without blocking graph reads, edits, or upload publication.
+        with _inference_lock:
+            ce = _get_cross_encoder(model_name)
+            raw_scores = list(ce.rerank(query, [chunk.text for chunk in chunks]))
+            if len(raw_scores) != len(chunks) or not all(math.isfinite(float(score)) for score in raw_scores):
+                raise ValueError("Reranker returned invalid scores.")
     except Exception as exc:
-        logger.error(f"Cross-encoder failed ({exc}); returning chunks unranked.")
-        return chunks
+        return _degraded(chunks, exc, min_relevancy, max_sources)
 
     scored: list[tuple[Chunk, float]] = []
     for chunk, raw in zip(chunks, raw_scores):
@@ -102,8 +146,7 @@ def rerank(
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    if max_sources is not None:
-        scored = scored[:max_sources]
+    scored = _cap(scored, max_sources)
 
     logger.debug(
         f"Reranker: {before} → {len(scored)} chunks "

@@ -3,7 +3,7 @@ Stage 2 — Concept Graph: graph_export.py
 
 Serialises the MultiDiGraph to a D3/Cytoscape-ready JSON the frontend
 mindmap consumes. Emits node_type on every node and distinguishes the
-structural relation types from free-form RELATED_TO semantic edges.
+directed hierarchy from plain, symmetric RELATED_TO concept connections.
 
 Output structure:
 {
@@ -44,14 +44,22 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import networkx as nx
+
+from backend.utils.files import atomic_write_text
+from backend.utils.associations import association_id, normalize_associations
 
 logger = logging.getLogger(__name__)
 
 
 _NODE_FIELDS = (
+    "title",
+    "body",
+    "x",
+    "y",
     "origin",
     "created_at",
     "updated_at",
@@ -89,8 +97,10 @@ def _edge_payload(u: str, v: str, attrs: dict) -> dict:
         "source_chunk_ids": list(attrs.get("source_chunk_ids", [])),
     }
     if attrs.get("relation") == "RELATED_TO":
-        payload["label"] = attrs.get("label")
+        payload["id"] = association_id(u, v)
+        payload["label"] = None
         payload["confidence"] = attrs.get("confidence")
+        payload["supports"] = deepcopy(attrs.get("supports", []))
     return payload
 
 
@@ -106,6 +116,7 @@ def export_graph(graph: nx.MultiDiGraph, output_path: str | Path) -> dict:
     Returns:
         The exported dict (same content as the written file).
     """
+    normalize_associations(graph)
     nodes = [
         _node_payload(n, a)
         for n, a in graph.nodes(data=True)
@@ -118,12 +129,10 @@ def export_graph(graph: nx.MultiDiGraph, output_path: str | Path) -> dict:
         if u in node_ids and v in node_ids
     ]
 
-    result = {"nodes": nodes, "edges": edges}
+    result = {"association_version": 1, "nodes": nodes, "edges": edges}
 
     output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+    atomic_write_text(output_path, json.dumps(result, indent=2))
 
     logger.info(
         f"Graph exported to {output_path} "

@@ -29,13 +29,14 @@ pdf_processor:
   min_heading_size: 14     # font pt size at or above which a line is treated as a heading
 
 vector_retriever:
-  model: all-MiniLM-L6-v2    # sentence-transformers model (cached after first download)
+  model: BAAI/bge-small-en-v1.5    # FastEmbed ONNX; English retrieval, 384 dimensions
   top_k: 5
 
 reranker:
-  model: cross-encoder/ms-marco-MiniLM-L-6-v2  # ~22 MB, CPU-friendly cross-encoder
+  model: Xenova/ms-marco-MiniLM-L-6-v2  # FastEmbed ONNX cross-encoder
 
 graph_retriever:
+  max_chunks: 80             # cap evidence before reranking; specific content precedes broad topic sources
   max_hops: 3                 # hard BFS depth cap
   relevance_threshold: 0.4   # cosine similarity cutoff for neighbour expansion
   max_nodes_per_hop: 10       # max neighbours to expand per BFS level
@@ -51,6 +52,9 @@ query_router:
   llm_max_tokens: 50
 
 generator:
+  # OpenRouter defaults to prompt JSON for arbitrary models. To require native
+  # schema/tool support explicitly, set structured_mode: native | tools | json.
+  # structured_mode: md_json
   provider: ollama             # ollama | anthropic
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
@@ -137,7 +141,7 @@ semantic_linker:
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
   anthropic_model: claude-haiku-4-5-20251001
-  max_tokens: 512
+  max_tokens: 2048                    # structured decisions include grounding passage IDs
   sim_lo: 0.55                       # related-but-not-duplicate lower bound
   sim_hi: 0.90                       # upper bound (higher = suspected duplicate)
   max_candidate_pairs: 80            # LLM budget cap per ingest
@@ -153,17 +157,4 @@ semantic_linker:
 
 illustration_worker:
   enabled: true
-  latex_dpi: 150            # DPI for equation PNG renders
-
-# ----------------------------------------------------------------------
-# Quiz & Exam Generator
-# ----------------------------------------------------------------------
-
-quiz_generator:
-  provider: ollama
-  ollama_model: qwen2.5:7b
-  ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
-  max_tokens: 8192
-  context_chars: 24000
-  batch_size: 1   # qwen2.5:7b reliably returns 1 question per call; set higher for larger models
+  # Equation hints stay as LaTeX; no server-side PNG rendering is needed.

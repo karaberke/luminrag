@@ -6,11 +6,11 @@ Topic → Subtopic → Content graph.
 
 Node types:   topic | subtopic | content
 Structural edges:  HAS_SUBTOPIC, HAS_CONTENT   (validated)
-Semantic edges:    RELATED_TO {label: str, confidence: float}  (free-form label)
+Semantic edges:    RELATED_TO with independent source/manual/note backing
 
 Polyhierarchy is achieved purely through edges — a single Content node may
 receive HAS_CONTENT from multiple Subtopics. MultiDiGraph supports parallel
-edges so distinct RELATED_TO labels coexist between the same pair.
+edges for directed hierarchy, while each unordered concept pair has one association.
 
 Public API:
     builder = GraphBuilder(graph_path)
@@ -23,10 +23,17 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import networkx as nx
+
+from backend.utils.files import atomic_write_text
+from backend.utils.associations import (
+    add_association, normalize_association_pair, normalize_associations,
+    remove_association, remove_association_supports,
+)
 
 from backend.graph.schema import (
     ALL_RELATIONS,
@@ -41,7 +48,6 @@ from backend.graph.schema import (
     TopicProposal,
     _now_iso,
     make_key,
-    normalise_relation_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,19 +95,25 @@ class GraphBuilder:
     # ------------------------------------------------------------------
 
     def save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        normalize_associations(self._graph)
         data = nx.node_link_data(self._graph)
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        atomic_write_text(self._path, json.dumps(data, indent=2))
         logger.info(
             f"Graph saved to {self._path} "
             f"({self.node_count()} nodes, {self.edge_count()} edges)"
         )
 
+    def clone(self, graph_path: str | Path) -> "GraphBuilder":
+        """Independent candidate graph, including nested node/edge attributes."""
+        candidate = deepcopy(self)
+        candidate._path = Path(graph_path)
+        return candidate
+
     def load(self) -> None:
         with open(self._path, encoding="utf-8") as f:
             data = json.load(f)
         self._graph = nx.node_link_graph(data, directed=True, multigraph=True)
+        normalize_associations(self._graph)
         logger.info(
             f"Graph loaded from {self._path} "
             f"({self.node_count()} nodes, {self.edge_count()} edges)"
@@ -254,15 +266,17 @@ class GraphBuilder:
         self,
         source_key: str,
         target_key: str,
-        label: str,
+        label: str | None = None,
         confidence: float = 0.5,
         source_chunk_ids: list[str] | None = None,
+        *,
+        kind: str = "manual",
+        owner: str | None = None,
+        verified: bool = False,
     ) -> bool:
         """
-        Add or merge a RELATED_TO semantic edge. The label is normalised to
-        snake_case; same (source, target, normalised_label) merges by
-        accumulating source_chunk_ids and taking max(confidence).
-        Returns True if a new edge was created, False if it merged.
+        Add plain, bidirectionally traversable relatedness. Legacy labels are
+        accepted but discarded; independent backing survives later cleanup.
         """
         if source_key not in self._graph or target_key not in self._graph:
             raise ValueError(
@@ -270,29 +284,8 @@ class GraphBuilder:
                 f"source={source_key!r}, target={target_key!r}"
             )
 
-        norm = normalise_relation_label(label)
-        chunk_ids = list(source_chunk_ids or [])
-        existing = self._graph.get_edge_data(source_key, target_key) or {}
-        for edge_data in existing.values():
-            if (
-                edge_data.get("relation") == "RELATED_TO"
-                and edge_data.get("label") == norm
-            ):
-                edge_data["confidence"] = max(
-                    float(edge_data.get("confidence", 0.0)), float(confidence)
-                )
-                _merge_source_ids(edge_data.setdefault("source_chunk_ids", []), chunk_ids)
-                return False
-
-        self._graph.add_edge(
-            source_key,
-            target_key,
-            relation="RELATED_TO",
-            label=norm,
-            confidence=float(confidence),
-            source_chunk_ids=chunk_ids,
-        )
-        return True
+        return add_association(self._graph, source_key, target_key, kind=kind, owner=owner,
+                               confidence=confidence, source_chunk_ids=source_chunk_ids, verified=verified)
 
     # ------------------------------------------------------------------
     # Mutations (used by API endpoints)
@@ -304,6 +297,61 @@ class GraphBuilder:
         self._graph.remove_node(key)
         return True
 
+    def merge_nodes(self, keep: str, drop: str) -> str:
+        """Merge attributes and rewire incident edges, preserving evidence."""
+        if keep == drop or keep not in self._graph or drop not in self._graph:
+            raise ValueError("Choose two different existing nodes to merge.")
+        incident_pairs = {tuple(sorted((u, v))) for u, v, attrs in
+                          (*self._graph.in_edges(drop, data=True), *self._graph.out_edges(drop, data=True))
+                          if attrs.get("relation") == "RELATED_TO"}
+        for source, target in incident_pairs:
+            normalize_association_pair(self._graph, source, target)
+        retained, removed = self._graph.nodes[keep], self._graph.nodes[drop]
+        previous_note_text = (retained.get("title") or retained.get("name"), retained.get("body", ""))
+        for field in ("source_ids", "key_terms", "parent_topic_keys", "parent_subtopic_keys"):
+            _merge_source_ids(retained.setdefault(field, []), removed.get(field, []))
+        for field in ("summary", "raw_excerpt", "body"):
+            if len(removed.get(field) or "") > len(retained.get(field) or ""):
+                retained[field] = removed[field]
+        invalidated = {"note:" + drop} if removed.get("node_type") == "note" else set()
+        if retained.get("node_type") == "note" and previous_note_text != (retained.get("title") or retained.get("name"), retained.get("body", "")):
+            invalidated.add("note:" + keep)
+        if invalidated:
+            # A checked passage cannot be renamed to a different note body
+            # while keeping its previous verification claim.
+            for key in (keep, drop):
+                remove_association_supports(self._graph, incident_to=key, invalidated_chunk_ids=invalidated)
+        edges = [(u, v, deepcopy(attrs)) for u, v, attrs in (*self._graph.in_edges(drop, data=True), *self._graph.out_edges(drop, data=True))]
+        self._graph.remove_node(drop)
+        for source, target, attrs in edges:
+            source = keep if source == drop else source
+            target = keep if target == drop else target
+            if attrs.get("relation") == "RELATED_TO":
+                if source == target:
+                    continue
+                records = attrs.get("supports") or [{"kind": "legacy", "owner": None,
+                    "source_chunk_ids": attrs.get("source_chunk_ids", []), "confidence": attrs.get("confidence", 0.5), "verified": False}]
+                for support in records:
+                    add_association(self._graph, source, target, kind=support["kind"],
+                                    owner=keep if support.get("owner") == drop else support.get("owner"),
+                                    source_chunk_ids=["note:" + keep if value == "note:" + drop else value for value in support.get("source_chunk_ids", [])],
+                                    confidence=support["confidence"], verified=support.get("verified", False))
+                continue
+            existing = self._graph.get_edge_data(source, target) or {}
+            match = next((item for item in existing.values() if item.get("relation") == attrs.get("relation") and item.get("label") == attrs.get("label")), None)
+            if match is not None:
+                _merge_source_ids(match.setdefault("source_chunk_ids", []), attrs.get("source_chunk_ids", []))
+                if "confidence" in attrs:
+                    match["confidence"] = max(float(match.get("confidence", 0)), float(attrs["confidence"]))
+            else:
+                self._graph.add_edge(source, target, **attrs)
+        for _, attrs in self._graph.nodes(data=True):
+            for field in ("parent_topic_keys", "parent_subtopic_keys"):
+                if field in attrs:
+                    attrs[field] = list(dict.fromkeys(keep if key == drop else key for key in attrs[field]))
+        retained["updated_at"] = _now_iso()
+        return keep
+
     def remove_edge(
         self,
         source_key: str,
@@ -312,28 +360,29 @@ class GraphBuilder:
         label: str | None = None,
     ) -> bool:
         """
-        Remove an edge matching (source, relation, target). For RELATED_TO
-        edges, `label` narrows the match to a specific normalised label.
+        Remove a directed structural edge or the complete plain association.
         Returns True if an edge was removed.
         """
+        if relation == "RELATED_TO":
+            return remove_association(self._graph, source_key, target_key)
         existing = self._graph.get_edge_data(source_key, target_key) or {}
-        norm_label = normalise_relation_label(label) if label else None
         for edge_key, edge_data in existing.items():
             if edge_data.get("relation") != relation:
                 continue
-            if relation == "RELATED_TO" and norm_label is not None:
-                if edge_data.get("label") != norm_label:
-                    continue
             self._graph.remove_edge(source_key, target_key, key=edge_key)
             return True
         return False
 
     def prune_disconnected(self) -> int:
         """
-        Remove all nodes that have no edges (in-degree + out-degree == 0).
+        Remove generated nodes that have no edges (in-degree + out-degree == 0).
+        Manual nodes can be deliberate standalone notes and must survive ingestion.
         Returns the number of nodes removed.
         """
-        isolated = [n for n in self._graph.nodes() if self._graph.degree(n) == 0]
+        isolated = [
+            n for n, attrs in self._graph.nodes(data=True)
+            if self._graph.degree(n) == 0 and attrs.get("origin") != "manual"
+        ]
         for n in isolated:
             self._graph.remove_node(n)
         if isolated:
@@ -342,68 +391,31 @@ class GraphBuilder:
 
     def prune_to_ratio(self) -> dict[str, int]:
         """
-        Enforce the invariant:
+        Report (never enforce) the soft shape heuristic:
             # content nodes > # subtopic nodes > # topic nodes
 
-        Removes the *least-connected* nodes of whichever type is
-        over-represented, iterating until the invariant holds (or
-        until we cannot remove more without emptying a tier).
+        Earlier versions deleted the least-connected topics/subtopics until
+        the heuristic held, which destroyed valid, connected concepts (a
+        1-topic/1-subtopic/1-content graph vanished entirely). The ratio is
+        aesthetic, not a correctness invariant, so a violation is only logged.
 
-        After this call you should run prune_disconnected() again because
-        removing a topic cascades to orphan any subtopics that had only
-        that topic as a parent.
-
-        Returns a dict with the count removed per node type.
+        Kept for API compatibility: returns the removed count per node type,
+        which is always zero.
         """
-        removed: dict[str, int] = {"topic": 0, "subtopic": 0}
+        counts = {"topic": 0, "subtopic": 0, "content": 0}
+        for _, a in self._graph.nodes(data=True):
+            ntype = a.get("node_type")
+            if ntype in counts:
+                counts[ntype] += 1
 
-        def _by_type(ntype: str) -> list[tuple[str, int]]:
-            """Return [(node_id, degree), …] sorted ascending by degree."""
-            return sorted(
-                [
-                    (n, self._graph.degree(n))
-                    for n, a in self._graph.nodes(data=True)
-                    if a.get("node_type") == ntype
-                ],
-                key=lambda x: x[1],
-            )
-
-        for _ in range(20):
-            topics    = _by_type("topic")
-            subtopics = _by_type("subtopic")
-            contents  = _by_type("content")
-
-            n_t, n_s, n_c = len(topics), len(subtopics), len(contents)
-            changed = False
-
-            # --- Rule 1: n_subtopic > n_topic ---
-            if n_t > 0 and n_s > 0 and n_t >= n_s:
-                # Need n_t < n_s  →  remove (n_t - n_s + 1) least-connected topics
-                to_remove = n_t - n_s + 1
-                for node_id, _ in topics[:to_remove]:
-                    self._graph.remove_node(node_id)
-                    removed["topic"] += 1
-                changed = True
-                continue  # re-count before checking rule 2
-
-            # --- Rule 2: n_content > n_subtopic ---
-            if n_s > 0 and n_c > 0 and n_s >= n_c:
-                to_remove = n_s - n_c + 1
-                for node_id, _ in subtopics[:to_remove]:
-                    self._graph.remove_node(node_id)
-                    removed["subtopic"] += 1
-                changed = True
-                continue
-
-            if not changed:
-                break
-
-        if any(removed.values()):
+        n_t, n_s, n_c = counts["topic"], counts["subtopic"], counts["content"]
+        if (n_t and n_s and n_t >= n_s) or (n_s and n_c and n_s >= n_c):
             logger.info(
-                f"prune_to_ratio: removed {removed['topic']} topic(s), "
-                f"{removed['subtopic']} subtopic(s)"
+                f"prune_to_ratio: hierarchy shape {n_t} topic(s) / {n_s} subtopic(s) / "
+                f"{n_c} content(s) does not satisfy content > subtopic > topic; "
+                "leaving nodes intact"
             )
-        return removed
+        return {"topic": 0, "subtopic": 0}
 
     # ------------------------------------------------------------------
     # Stage-1 → Stage-2: the single entry point ingestion uses
@@ -531,6 +543,8 @@ class GraphBuilder:
                 rp.label,
                 rp.confidence,
                 rp.source_chunk_ids,
+                kind="automatic",
+                verified=rp.verified,
             )
             if added:
                 result.related_edges_added += 1

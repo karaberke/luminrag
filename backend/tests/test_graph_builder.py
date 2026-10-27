@@ -189,15 +189,16 @@ class TestRelatedTo:
         edges = builder.graph.get_edge_data(a, b)
         data = list(edges.values())[0]
         assert data["relation"] == "RELATED_TO"
-        assert data["label"] == "uses"
+        assert data["label"] is None
+        assert data["supports"][0]["kind"] == "manual"
         assert data["confidence"] == 0.8
 
-    def test_normalises_label(self, builder):
+    def test_legacy_label_argument_does_not_add_display_label(self, builder):
         a = builder.add_node(TopicAttrs(name="NLP"))
         b = builder.add_node(TopicAttrs(name="Graph Theory"))
         builder.add_related_to(a, b, "Used In!")
         data = list(builder.graph.get_edge_data(a, b).values())[0]
-        assert data["label"] == "used_in"
+        assert data["label"] is None
 
     def test_merges_same_label_max_confidence(self, builder):
         a = builder.add_node(TopicAttrs(name="NLP"))
@@ -208,12 +209,12 @@ class TestRelatedTo:
         data = list(builder.graph.get_edge_data(a, b).values())[0]
         assert data["confidence"] == 0.7
 
-    def test_different_labels_kept_as_parallel_edges(self, builder):
+    def test_different_legacy_labels_share_one_association(self, builder):
         a = builder.add_node(TopicAttrs(name="NLP"))
         b = builder.add_node(TopicAttrs(name="Graph Theory"))
         builder.add_related_to(a, b, "uses")
         builder.add_related_to(a, b, "generalises")
-        assert len(builder.graph.get_edge_data(a, b)) == 2
+        assert len(builder.graph.get_edge_data(a, b)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +320,11 @@ class TestApplyProposals:
 # ---------------------------------------------------------------------------
 
 class TestPruneDisconnected:
+    def test_preserves_standalone_manual_notes(self, builder):
+        key = builder.add_node(ContentAttrs(name="My note", origin="manual"))
+        assert builder.prune_disconnected() == 0
+        assert builder.get_node(key) is not None
+
     def test_removes_isolated_nodes(self, builder):
         builder.add_node(TopicAttrs(name="Orphan"))
         tkey = builder.add_node(TopicAttrs(name="NLP"))
@@ -337,7 +343,7 @@ class TestPruneDisconnected:
 
 
 # ---------------------------------------------------------------------------
-# prune_to_ratio — enforce content > subtopics > topics
+# prune_to_ratio — report the shape heuristic without removing evidence
 # ---------------------------------------------------------------------------
 
 def _connected_pyramid(builder: GraphBuilder, n_topics: int, n_subs: int, n_contents: int):
@@ -366,32 +372,30 @@ class TestPruneToRatio:
         removed = builder.prune_to_ratio()
         assert removed == {"topic": 0, "subtopic": 0}
 
-    def test_too_many_topics_trimmed(self, builder):
+    def test_many_topics_preserved(self, builder):
         # 3 topics, 3 subtopics, 4 contents → violates subtopic > topic
         _connected_pyramid(builder, n_topics=3, n_subs=3, n_contents=4)
         builder.prune_to_ratio()
         n_t = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "topic")
         n_s = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "subtopic")
-        assert n_t < n_s
+        assert n_t == n_s == 3
 
-    def test_too_many_subtopics_trimmed(self, builder):
+    def test_many_subtopics_preserved(self, builder):
         # 1 topic, 4 subtopics, 4 contents → violates content > subtopic
         _connected_pyramid(builder, n_topics=1, n_subs=4, n_contents=4)
         builder.prune_to_ratio()
         n_s = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "subtopic")
         n_c = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "content")
-        assert n_s < n_c
+        assert n_s == n_c == 4
 
-    def test_both_violations_resolved(self, builder):
+    def test_equal_tiers_preserved(self, builder):
         # 5 topics, 5 subtopics, 5 contents → both rules violated
         _connected_pyramid(builder, n_topics=5, n_subs=5, n_contents=5)
         builder.prune_to_ratio()
-        builder.prune_disconnected()
         n_t = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "topic")
         n_s = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "subtopic")
         n_c = sum(1 for _, a in builder.graph.nodes(data=True) if a.get("node_type") == "content")
-        assert n_c > n_s
-        assert n_s > n_t
+        assert n_c == n_s == n_t == 5
 
 
 # ---------------------------------------------------------------------------
@@ -416,15 +420,14 @@ class TestRemove:
         assert builder.remove_edge(t, "HAS_SUBTOPIC", s) is True
         assert builder.edge_count() == 0
 
-    def test_remove_related_to_by_label(self, builder):
+    def test_remove_related_to_ignores_legacy_label_and_removes_association(self, builder):
         a = builder.add_node(TopicAttrs(name="NLP"))
         b = builder.add_node(TopicAttrs(name="Graph Theory"))
         builder.add_related_to(a, b, "uses")
         builder.add_related_to(a, b, "generalises")
         assert builder.remove_edge(a, "RELATED_TO", b, label="uses") is True
-        remaining = list(builder.graph.get_edge_data(a, b).values())
-        assert len(remaining) == 1
-        assert remaining[0]["label"] == "generalises"
+        assert builder.graph.get_edge_data(a, b) is None
+        assert builder.graph.get_edge_data(b, a) is None
 
 
 # ---------------------------------------------------------------------------

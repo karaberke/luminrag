@@ -1,9 +1,12 @@
-import { useRef, useState } from 'react'
+import BrandMark from './BrandMark'
+import { useEffect, useRef, useState } from 'react'
 import type { Message } from '../types'
 import EvidenceChip from './EvidenceChip'
 import ReflectionBadge from './ReflectionBadge'
-import { RichText } from './RichText'
-import { useTheme } from '../ThemeContext'
+import RichText from './LazyRichText'
+import { useTheme } from '../theme'
+import { citationIndex, citedEvidenceIndices, injectCitationLinks } from '../utils/citations'
+import { openSourceEvidence, sourceDisplayName } from '../utils/source'
 
 const modeLabel: Record<string, string> = {
   dense:  'Dense RAG',
@@ -30,34 +33,37 @@ interface Props {
   message: Message
 }
 
-// Convert standalone [N] citation markers into markdown links (#citation-N).
-// Skips [N](url) and [N][ref] patterns that are already part of a link.
-function injectCitationLinks(text: string): string {
-  return text.replace(/\[(\d+)\](?!\(|\[)/g, '[$1](#citation-$1)')
-}
-
 export default function MessageBubble({ message }: Props) {
   const [showEvidence, setShowEvidence] = useState(false)
   const [showReflection, setShowReflection] = useState(false)
-  const [highlightedChip, setHighlightedChip] = useState<number | null>(null)
+  const [citation, setCitation] = useState<{ index: number } | null>(null)
+  const [expandedChips, setExpandedChips] = useState<Set<number>>(new Set())
   const chipRefs = useRef<(HTMLDivElement | null)[]>([])
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+  const cited = citedEvidenceIndices(message.content, message.evidence?.length ?? 0)
 
   const handleCitationClick = (n: number) => {
+    const index = citationIndex(n, message.evidence?.length ?? 0)
+    if (index === null) return
+    openSourceEvidence(message.evidence![index])
     setShowEvidence(true)
-    const idx = n - 1
-    setTimeout(() => {
-      chipRefs.current[idx]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-      setHighlightedChip(idx)
-      setTimeout(() => setHighlightedChip(null), 1500)
-    }, 60)
+    setExpandedChips((previous) => new Set([...previous, index]))
+    setCitation({ index })
   }
+  useEffect(() => {
+    if (!citation || !showEvidence) return
+    const element = chipRefs.current[citation.index]
+    element?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    element?.focus({ preventScroll: true })
+    const timer = setTimeout(() => setCitation(null), 2000)
+    return () => clearTimeout(timer)
+  }, [citation, showEvidence])
 
   if (message.role === 'user') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[75%] rounded-2xl rounded-tr-sm bg-indigo-600 px-4 py-3 text-sm text-white shadow">
+        <div className="lumin-message-user max-w-[75%] rounded-2xl rounded-tr-sm bg-indigo-600 px-4 py-3 text-sm text-white shadow">
           {message.content}
         </div>
       </div>
@@ -70,9 +76,7 @@ export default function MessageBubble({ message }: Props) {
     <div className="flex flex-col gap-2">
       <div className="flex items-start gap-3">
         {/* Avatar */}
-        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-0.5">
-          L
-        </div>
+        <BrandMark size="small" />
 
         <div className="flex-1 min-w-0">
           {/* Mode badge */}
@@ -82,13 +86,13 @@ export default function MessageBubble({ message }: Props) {
             >
               {modeLabel[message.routing_mode]}
               {message.hops && message.hops.length > 0 && (
-                <span className="ml-1 opacity-70">· {message.hops.length} hops</span>
+                <span className="ml-1 opacity-70">· {message.hops.length} graph nodes</span>
               )}
             </span>
           )}
 
           {/* Answer text — RichText so LaTeX + markdown render. */}
-          <div className={`rounded-2xl rounded-tl-sm border px-4 py-3 text-sm leading-relaxed ${
+          <div className={`lumin-message-assistant rounded-2xl rounded-tl-sm border px-4 py-3 text-sm leading-relaxed ${
             isDark
               ? 'bg-slate-800 border-slate-700 text-slate-200'
               : 'bg-white border-slate-200 text-slate-800 shadow-sm'
@@ -109,7 +113,7 @@ export default function MessageBubble({ message }: Props) {
                 }`}
               >
                 <span>{showEvidence ? '▾' : '▸'}</span>
-                {message.evidence.length} source{message.evidence.length !== 1 ? 's' : ''}
+                {message.evidence.length} retrieved passage{message.evidence.length !== 1 ? 's' : ''} · {cited.size} cited
               </button>
             )}
             {message.reflection && (
@@ -129,8 +133,8 @@ export default function MessageBubble({ message }: Props) {
           {showEvidence && message.evidence && (
             <div className="mt-2 flex flex-col gap-2">
               {message.evidence.map((chunk, i) => (
-                <div key={chunk.id} ref={(el) => { chipRefs.current[i] = el }}>
-                  <EvidenceChip chunk={chunk} index={i} highlighted={highlightedChip === i} />
+                <div key={chunk.id} ref={(el) => { chipRefs.current[i] = el }} tabIndex={-1} aria-label={`Source ${i + 1}: ${sourceDisplayName(chunk)}`}>
+                  <EvidenceChip chunk={chunk} index={i} cited={cited.has(i)} highlighted={citation?.index === i} expanded={expandedChips.has(i)} onExpandedChange={(expanded) => setExpandedChips((previous) => { const next = new Set(previous); if (expanded) next.add(i); else next.delete(i); return next })} />
                 </div>
               ))}
             </div>

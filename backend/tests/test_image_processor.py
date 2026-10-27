@@ -60,6 +60,19 @@ def base_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class TestGetDimensions:
+    @pytest.mark.parametrize("name,format", [("photo.jpg", "JPEG"), ("photo.png", "PNG"), ("photo.webp", "WEBP")])
+    def test_allowed_decoders_read_matching_content(self, tmp_path, name, format):
+        path = tmp_path / name
+        PILImage.new("RGB", (20, 30)).save(path, format)
+        assert _get_dimensions(path) == (20, 30)
+
+    def test_renamed_unsupported_image_cannot_activate_other_decoder(self, tmp_path):
+        path = tmp_path / "disguised.png"
+        PILImage.new("RGB", (20, 30)).save(path, "TIFF")
+        from PIL import UnidentifiedImageError
+        with pytest.raises(UnidentifiedImageError):
+            _get_dimensions(path)
+
     def test_returns_correct_width_height(self, tmp_path):
         img_path = _make_image(tmp_path, width=320, height=240)
         w, h = _get_dimensions(img_path)

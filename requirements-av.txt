@@ -1,0 +1,5 @@
+# Optional, self-host only. ffmpeg must also be installed on the host.
+faster-whisper==1.2.1
+opencv-python-headless==4.13.0.92
+scikit-image==0.26.0
+setuptools==84.1.0

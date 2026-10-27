@@ -10,8 +10,9 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+MAX_CHUNK_TEXT_CHARACTERS = 100_000
 
-Modality = Literal["video", "slide", "pdf", "image", "audio"]
+Modality = Literal["video", "slide", "pdf", "image", "audio", "note", "markdown", "office"]
 RoutingMode = Literal["dense", "graph", "hybrid", "none"]
 
 
@@ -32,6 +33,9 @@ class Chunk(BaseModel):
     # Slide/PDF-specific metadata keys:
     #   page_number: int
     #   slide_title: str|None
+    #   page_start / page_end: int — actual PDF passage page span
+    #   slide_number: int — original PowerPoint slide number
+    #   section_title / original_filename: str|None
 
 
 class GraphTriple(BaseModel):
@@ -65,6 +69,16 @@ class ReflectionVerdict(BaseModel):
     reasoning: str
 
 
+class CitationSpan(BaseModel):
+    """Verified quote in one numbered passage; offsets address original chunk text."""
+
+    chunk_id: str
+    source_number: int = Field(ge=1)
+    quote: str
+    quote_start: int = Field(ge=0)
+    quote_end: int = Field(ge=0)  # exclusive, Python Unicode character offsets
+
+
 class GenerationResult(BaseModel):
     """Final output of the generation stage."""
 
@@ -72,3 +86,4 @@ class GenerationResult(BaseModel):
     routing_mode: RoutingMode
     reflection: ReflectionVerdict
     evidence_chunk_ids: list[str]  # chunk ids cited in the answer
+    citations: list[CitationSpan] = Field(default_factory=list)

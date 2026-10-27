@@ -1,0 +1,57 @@
+{
+  "format_version": 1,
+  "models": {
+    "BAAI/bge-small-en-v1.5": {
+      "repo_id": "Qdrant/bge-small-en-v1.5-onnx-Q",
+      "revision": "aa8f8b060edb00e03bfdd08813a2949946c8ba55",
+      "files": {
+        "config.json": {
+          "sha256": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
+          "size": 706
+        },
+        "model_optimized.onnx": {
+          "sha256": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
+          "size": 66465124
+        },
+        "special_tokens_map.json": {
+          "sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+          "size": 695
+        },
+        "tokenizer.json": {
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+          "size": 711396
+        },
+        "tokenizer_config.json": {
+          "sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+          "size": 1242
+        }
+      }
+    },
+    "Xenova/ms-marco-MiniLM-L-6-v2": {
+      "repo_id": "Xenova/ms-marco-MiniLM-L-6-v2",
+      "revision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+      "files": {
+        "config.json": {
+          "sha256": "d827779a72d27ae68cf878a6fc2e954542663fe21ca515d9f4783fc96be2d37e",
+          "size": 824
+        },
+        "special_tokens_map.json": {
+          "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+          "size": 125
+        },
+        "tokenizer.json": {
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+          "size": 711396
+        },
+        "tokenizer_config.json": {
+          "sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+          "size": 1242
+        },
+        "onnx/model.onnx": {
+          "sha256": "c623d0bcb99f4622beb413eaef00cfbe5db20df9f1dd982da4b4f26022881870",
+          "size": 90992115
+        }
+      }
+    }
+  }
+}

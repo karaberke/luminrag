@@ -25,11 +25,12 @@ Public API:
 from __future__ import annotations
 
 import logging
-import subprocess
+import math
 import tempfile
 from pathlib import Path
 
 from backend.schemas import Chunk
+from backend.ingestion.media_limits import decode_audio, transcribe_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +43,7 @@ _SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma"
 
 def _to_wav(audio_path: Path, tmp_dir: str) -> Path:
     """Convert any supported audio format to a 16 kHz mono WAV using ffmpeg."""
-    wav_path = Path(tmp_dir) / "audio.wav"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(audio_path),
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        str(wav_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg failed for {audio_path}:\n{result.stderr.decode()}"
-        )
-    return wav_path
+    return decode_audio(audio_path, tmp_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -68,20 +55,7 @@ def _transcribe(audio_path: Path, cfg: dict) -> list[dict]:
     Transcribe audio with faster-whisper.
     Returns list of {start: float, end: float, text: str}.
     """
-    from faster_whisper import WhisperModel
-
-    w = cfg["whisper"]
-    model = WhisperModel(
-        w["model_size"],
-        device=w.get("device", "cpu"),
-        compute_type=w.get("compute_type", "int8"),
-    )
-    segments, _ = model.transcribe(str(audio_path), beam_size=5)
-    return [
-        {"start": s.start, "end": s.end, "text": s.text.strip()}
-        for s in segments
-        if s.text.strip()
-    ]
+    return transcribe_bounded(audio_path, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +79,8 @@ def _build_chunks(
     Returns:
         Ordered list of Chunk objects.
     """
+    if not math.isfinite(window_sec) or window_sec < 1:
+        raise ValueError("Audio chunk window must be at least one second.")
     if not segments:
         return []
 
@@ -183,6 +159,8 @@ def process_audio(audio_path: str | Path, config: dict) -> list[Chunk]:
 
     source_id = audio_path.stem
     window_sec = float(config.get("audio_processor", {}).get("chunk_window_sec", 60.0))
+    if not math.isfinite(window_sec) or window_sec < 1:
+        raise ValueError("Audio chunk window must be at least one second.")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         logger.info(f"[{source_id}] Converting to WAV…")

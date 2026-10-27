@@ -21,53 +21,22 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel
+from backend.llm import complete, structured
+
 if TYPE_CHECKING:
     from backend.retrieval.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 
 
-def call_llm(prompt: str, cfg: dict, *, max_tokens: int | None = None) -> str:
-    """
-    Run a one-shot prompt against the configured provider. Returns raw
-    response text. Raises on transport errors.
-    """
-    provider = cfg.get("provider", "ollama")
-    tokens = max_tokens if max_tokens is not None else cfg.get("max_tokens", 512)
-
-    if provider == "ollama":
-        return _call_ollama(prompt, cfg, tokens)
-    if provider == "anthropic":
-        return _call_anthropic(prompt, cfg, tokens)
-    raise ValueError(f"Unknown provider: '{provider}'")
-
-
-def _call_ollama(prompt: str, cfg: dict, max_tokens: int) -> str:
-    import httpx
-
-    payload = {
-        "model": cfg.get("ollama_model", "llama3.2:3b"),
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"num_predict": max_tokens},
-    }
-    base_url = cfg.get("ollama_base_url", "http://localhost:11434")
-    response = httpx.post(f"{base_url}/api/generate", json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json()["response"]
-
-
-def _call_anthropic(prompt: str, cfg: dict, max_tokens: int) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=cfg.get("anthropic_model", "claude-haiku-4-5-20251001"),
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
+def call_llm(prompt: str, cfg: dict, *, max_tokens: int | None = None,
+             response_model: type[BaseModel] | None = None) -> str:
+    """Compatibility re-export for integrations from earlier self-host releases."""
+    options = cfg if max_tokens is None else {**cfg, "max_tokens": max_tokens}
+    if response_model is not None:
+        return structured(prompt, options, response_model).model_dump_json()
+    return complete(prompt, options)
 
 
 _FENCE_OPEN = re.compile(r"^```(?:json)?\s*", re.IGNORECASE)
@@ -110,17 +79,18 @@ def parse_json_list(response: str) -> list[dict]:
     return []
 
 
-def safe_call_json(prompt: str, cfg: dict, *, max_tokens: int | None = None) -> list[dict]:
-    """
-    Convenience: call the LLM and parse the response as a JSON array.
-    Returns [] on any failure (logged at WARN).
-    """
+def safe_call_json(prompt: str, cfg: dict, *, max_tokens: int | None = None,
+                   response_model: type[BaseModel] | None = None) -> list[dict]:
+    """Validated list extraction; legacy callers can still parse raw text."""
     try:
-        raw = call_llm(prompt, cfg, max_tokens=max_tokens)
+        options = cfg if max_tokens is None else {**cfg, "max_tokens": max_tokens}
+        if response_model is not None:
+            result = structured(prompt + "\nReturn an object with an items array.", options, response_model)
+            return result.model_dump(mode="json")["items"]
+        return parse_json_list(call_llm(prompt, options))
     except Exception as exc:
-        logger.warning(f"LLM call failed: {exc}")
+        logger.warning("LLM extraction failed (%s)", type(exc).__name__)
         return []
-    return parse_json_list(raw)
 
 
 def resolve_synonym(

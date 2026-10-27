@@ -1,28 +1,29 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import type { GraphNode, GraphEdge, EvidenceChunk } from '../types'
-import { useTheme } from '../ThemeContext'
-import { RichText } from './RichText'
-import { sourceUrl } from '../utils/source'
+import { useTheme } from '../theme'
+import RichText from './LazyRichText'
+import { evidenceWithContext, openSourceEvidence, sourceDisplayName, sourceLocation, sourceUrl } from '../utils/source'
+import { errorMessage, resolveAssetUrl } from '../utils/api'
 
+/**
+ * Detail view for one graph node. Render with `key={node.id}` so that edit
+ * state starts fresh whenever a different node is selected.
+ */
 interface Props {
   node: GraphNode
   edges: GraphEdge[]
   allNodes: GraphNode[]
   evidence: EvidenceChunk[]
   evidenceLoading?: boolean
-  apiBase: string
   onClose: () => void
   editMode?: boolean
   onDeleteNode?: (nodeId: string) => void
-  onDeleteEdge?: (source: string, relation: string, target: string, label?: string) => void
-  onUpdateNode?: (nodeId: string, updates: Record<string, unknown>) => void
+  onDeleteEdge?: (source: string, relation: string, target: string) => void
+  /** Resolves once the update is persisted; rejects with a displayable error. */
+  onUpdateNode?: (nodeId: string, updates: Record<string, unknown>) => Promise<void>
 }
 
 const CONTENT_TYPES = ['definition', 'theorem', 'technique', 'example', 'question', 'figure', 'other']
-
-function edgeLabel(e: GraphEdge): string {
-  return e.relation === 'RELATED_TO' && e.label ? e.label : e.relation
-}
 
 /** Group evidence chunks by source_id so a paper with 5 cited pages shows up once. */
 function groupEvidenceBySource(evidence: EvidenceChunk[]): Array<{
@@ -46,6 +47,7 @@ function typeChip(nodeType: string, isDark: boolean): string {
       case 'topic':    return 'bg-indigo-950 text-indigo-300 border-indigo-800'
       case 'subtopic': return 'bg-purple-950 text-purple-300 border-purple-800'
       case 'content':  return 'bg-teal-950 text-teal-300 border-teal-800'
+      case 'note': return 'bg-amber-950 text-amber-300 border-amber-800'
       default:         return 'bg-slate-800 text-slate-400 border-slate-700'
     }
   }
@@ -53,12 +55,14 @@ function typeChip(nodeType: string, isDark: boolean): string {
     case 'topic':    return 'bg-indigo-50 text-indigo-700 border-indigo-200'
     case 'subtopic': return 'bg-purple-50 text-purple-700 border-purple-200'
     case 'content':  return 'bg-teal-50 text-teal-700 border-teal-200'
+    case 'note': return 'bg-amber-50 text-amber-700 border-amber-200'
     default:         return 'bg-slate-50 text-slate-600 border-slate-200'
   }
 }
 
 interface Draft {
   name: string
+  body: string
   summary: string
   scope: string
   content_type: string
@@ -70,6 +74,7 @@ interface Draft {
 function nodeToDraft(node: GraphNode): Draft {
   return {
     name: node.name ?? '',
+    body: node.body ?? '',
     summary: node.summary ?? '',
     scope: node.scope ?? 'broad',
     content_type: node.content_type ?? 'other',
@@ -85,7 +90,6 @@ export default function NodeDetailPanel({
   allNodes,
   evidence,
   evidenceLoading = false,
-  apiBase,
   onClose,
   editMode = false,
   onDeleteNode,
@@ -100,36 +104,40 @@ export default function NodeDetailPanel({
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
   const [draft, setDraft] = useState<Draft>(() => nodeToDraft(node))
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
-  // Reset edit state whenever the selected node changes
-  useEffect(() => {
-    setIsEditing(false)
-    setDraft(nodeToDraft(node))
-  }, [node.id]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const outgoing = edges.filter((e) => e.source === node.id)
-  const incoming = edges.filter((e) => e.target === node.id)
+  const connections = edges.filter((e) => e.source === node.id || e.target === node.id)
   const keyTerms = (node.key_terms ?? []).filter((t) => t && t.trim())
   const rawExcerpt = (node.raw_excerpt ?? '').trim()
-  const illustrationPath = node.illustration_path ?? null
-  const illustrationSrc = illustrationPath
-    ? (/^https?:\/\//.test(illustrationPath) || illustrationPath.startsWith('/')
-        ? `${apiBase}${illustrationPath.startsWith('/') ? '' : '/'}${illustrationPath}`
-        : `${apiBase}/${illustrationPath}`)
-    : null
+  const illustrationSrc = resolveAssetUrl(node.illustration_path)
 
   const handleDeleteNode = () => {
-    if (!window.confirm(`Delete "${node.name}" and all its edges?`)) return
+    if (!confirmDelete) { setConfirmDelete(true); return }
     onDeleteNode?.(node.id)
     onClose()
   }
 
-  const handleSave = () => {
+  const startEditing = () => {
+    setDraft(nodeToDraft(node))
+    setSaveError(null)
+    setIsEditing(true)
+  }
+
+  const cancelEditing = () => {
+    setSaveError(null)
+    setIsEditing(false)
+  }
+
+  const handleSave = async () => {
+    if (saving) return
     const updates: Record<string, unknown> = {
       name: draft.name.trim() || node.name,
       summary: draft.summary.trim(),
     }
     if (node.node_type === 'topic') updates.scope = draft.scope
+    if (node.node_type === 'note') { updates.body = draft.body; updates.title = draft.name.trim() || node.name }
     if (node.node_type === 'content') {
       updates.content_type = draft.content_type
       updates.raw_excerpt = draft.raw_excerpt.trim()
@@ -139,8 +147,16 @@ export default function NodeDetailPanel({
         .filter(Boolean)
     }
     updates.source_ids = draft.source_ids
-    onUpdateNode?.(node.id, updates)
-    setIsEditing(false)
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await onUpdateNode?.(node.id, updates)
+      setIsEditing(false)
+    } catch (e) {
+      setSaveError(`Save failed: ${errorMessage(e)}`)
+    } finally {
+      setSaving(false)
+    }
   }
 
   // Shared input/textarea styles
@@ -157,6 +173,7 @@ export default function NodeDetailPanel({
 
   return (
     <div className={panelClass}>
+      {confirmDelete && <div role="alertdialog" aria-label="Delete node" className="rounded-lg border border-red-500/30 p-3 mb-3 text-xs"><p>Delete “{node.name}” and its connections?</p><div className="flex gap-3 mt-2"><button onClick={handleDeleteNode} className="text-red-500">Delete node</button><button onClick={() => setConfirmDelete(false)}>Cancel</button></div></div>}
       {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div className="flex-1 min-w-0">
@@ -192,7 +209,7 @@ export default function NodeDetailPanel({
           {editMode && !isEditing && (
             <>
               <button
-                onClick={() => { setDraft(nodeToDraft(node)); setIsEditing(true) }}
+                onClick={startEditing}
                 className={`text-xs px-2 py-0.5 rounded border transition-colors ${
                   isDark
                     ? 'text-indigo-400 hover:text-indigo-300 border-indigo-800 hover:border-indigo-600'
@@ -219,17 +236,19 @@ export default function NodeDetailPanel({
             <>
               <button
                 onClick={handleSave}
-                className={`text-xs px-2 py-0.5 rounded border transition-colors ${
+                disabled={saving}
+                className={`text-xs px-2 py-0.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                   isDark
                     ? 'text-teal-400 hover:text-teal-300 border-teal-800 hover:border-teal-600'
                     : 'text-teal-700 hover:text-teal-800 border-teal-300 hover:border-teal-400'
                 }`}
               >
-                Save
+                {saving ? 'Saving…' : 'Save'}
               </button>
               <button
-                onClick={() => setIsEditing(false)}
-                className={`text-xs px-2 py-0.5 rounded border transition-colors ${
+                onClick={cancelEditing}
+                disabled={saving}
+                className={`text-xs px-2 py-0.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                   isDark
                     ? 'text-slate-400 hover:text-slate-300 border-slate-700'
                     : 'text-slate-500 hover:text-slate-700 border-slate-300'
@@ -258,6 +277,14 @@ export default function NodeDetailPanel({
           )}
         </div>
       </div>
+
+      {isEditing && saveError && (
+        <p role="alert" className={`text-xs rounded-lg px-2 py-1.5 mb-2 border break-words ${
+          isDark ? 'text-red-400 bg-red-950/40 border-red-800' : 'text-red-600 bg-red-50 border-red-300'
+        }`}>
+          {saveError}
+        </p>
+      )}
 
       {/* Scope selector — topic nodes, edit mode only */}
       {isEditing && node.node_type === 'topic' && (
@@ -319,6 +346,8 @@ export default function NodeDetailPanel({
       ) : null}
 
       {/* Key terms — pill chips (read-only) or comma input (edit) */}
+      {node.node_type === 'note' && (isEditing ? <div className="mb-4 space-y-2"><label className="block text-xs text-slate-500">Note · Markdown, LaTeX and [[wikilinks]]</label><textarea aria-label="Note body" value={draft.body} onChange={(event) => setDraft((previous) => ({ ...previous, body: event.target.value }))} className={`${inputCls} min-h-36 resize-y font-mono`} /><p className="text-[10px] uppercase text-slate-500">Live preview</p><RichText text={draft.body} className="text-xs rounded-lg border border-slate-500/20 p-3" /></div> : <RichText text={node.body ?? ''} className="text-xs leading-relaxed mb-4" />)}
+      {isEditing && node.node_type === 'content' && <div className="mb-3"><p className="text-[10px] uppercase text-slate-500 mb-1">Live preview</p><RichText text={draft.summary} className="text-xs border border-slate-500/20 rounded-lg p-2" /></div>}
       {isEditing && node.node_type === 'content' ? (
         <div className="mb-4">
           <label className={`text-[10px] uppercase tracking-wider font-medium block mb-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
@@ -438,7 +467,7 @@ export default function NodeDetailPanel({
               />
             ) : node.illustration?.kind === 'equation' && node.illustration.hint ? (
               <div className={`rounded border p-3 ${isDark ? 'border-slate-700 bg-slate-800/50' : 'border-slate-200 bg-slate-50'}`}>
-                <RichText text={node.illustration.hint} />
+                <RichText text={node.illustration.hint.includes('$') ? node.illustration.hint : `$$\n${node.illustration.hint}\n$$`} />
               </div>
             ) : node.illustration ? (
               <p className={`text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>{node.illustration.hint}</p>
@@ -447,48 +476,31 @@ export default function NodeDetailPanel({
         </div>
       )}
 
-      {/* Relations */}
-      {(outgoing.length > 0 || incoming.length > 0) && (
+      {/* Connections retain hierarchy without implying a semantic direction. */}
+      {connections.length > 0 && (
         <div className="space-y-1 mb-3">
           <p className={`text-[10px] uppercase tracking-wider font-medium ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-            Relations
+            Connections
           </p>
-          {outgoing.map((e) => (
-            <div key={e.id} className={`flex items-center gap-2 text-xs group ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-              <span className={`font-medium truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>{node.name}</span>
-              <span className="text-indigo-400 font-mono shrink-0">—{edgeLabel(e)}→</span>
-              <span className={`font-medium truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                {nodeMap[e.target]?.name ?? e.target}
+          {connections.map((e) => {
+            const otherId = e.source === node.id ? e.target : e.source
+            const hierarchy = e.relation === 'RELATED_TO' ? null : e.target === node.id ? 'Parent' : e.relation === 'HAS_SUBTOPIC' ? 'Subtopic' : 'Content'
+            return <div key={e.id} className={`flex items-center gap-2 text-xs group ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+              <span className="shrink-0">{hierarchy ? `${hierarchy}:` : '—'}</span>
+              <span className={`font-medium truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`} title={nodeMap[otherId]?.name ?? otherId}>
+                {nodeMap[otherId]?.name ?? otherId}
               </span>
               {editMode && (
                 <button
-                  onClick={() => onDeleteEdge?.(e.source, e.relation, e.target, e.label ?? undefined)}
+                  onClick={() => onDeleteEdge?.(e.source, e.relation, e.target)}
                   className="ml-auto opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-300 transition-opacity text-xs leading-none px-1 shrink-0"
-                  title="Delete this edge"
+                  title="Delete this connection"
                 >
                   ×
                 </button>
               )}
             </div>
-          ))}
-          {incoming.map((e) => (
-            <div key={e.id} className={`flex items-center gap-2 text-xs group ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-              <span className={`font-medium truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                {nodeMap[e.source]?.name ?? e.source}
-              </span>
-              <span className="text-indigo-400 font-mono shrink-0">—{edgeLabel(e)}→</span>
-              <span className={`font-medium truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>{node.name}</span>
-              {editMode && (
-                <button
-                  onClick={() => onDeleteEdge?.(e.source, e.relation, e.target, e.label ?? undefined)}
-                  className="ml-auto opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-300 transition-opacity text-xs leading-none px-1 shrink-0"
-                  title="Delete this edge"
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          ))}
+          })}
         </div>
       )}
 
@@ -508,7 +520,6 @@ export default function NodeDetailPanel({
             <SourceCard
               key={group.source}
               group={group}
-              apiBase={apiBase}
               isDark={isDark}
             />
           ))
@@ -521,15 +532,14 @@ export default function NodeDetailPanel({
 
 function SourceCard({
   group,
-  apiBase,
   isDark,
 }: {
   group: { source: string; modality: string; chunks: EvidenceChunk[] }
-  apiBase: string
   isDark: boolean
 }) {
-  const first = group.chunks[0]
-  const primaryUrl = sourceUrl(apiBase, group.source, group.modality, first.page, first.timestamp)
+  const first = evidenceWithContext(group.chunks[0])
+  const [expandedChunkId, setExpandedChunkId] = useState<string | null>(null)
+  const primaryUrl = sourceUrl(group.source, group.modality, first.page, first.timestamp)
 
   return (
     <div
@@ -540,13 +550,13 @@ function SourceCard({
       <div className="flex items-start justify-between gap-2 mb-1.5">
         <div className="min-w-0">
           <p className={`font-medium truncate ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>
-            {group.source}
+            {sourceDisplayName(first)}
           </p>
           <p className={`text-[10px] uppercase tracking-wider ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
             {group.modality} · {group.chunks.length} chunk{group.chunks.length > 1 ? 's' : ''}
           </p>
         </div>
-        <a
+        {group.modality !== 'note' && <a
           href={primaryUrl}
           target="_blank"
           rel="noreferrer"
@@ -555,19 +565,17 @@ function SourceCard({
               ? 'text-indigo-300 border-indigo-700 hover:bg-indigo-900/40'
               : 'text-indigo-700 border-indigo-300 hover:bg-indigo-50'
           }`}
-          title="Open original source in a new tab"
+          title={`Open original ${sourceDisplayName(first)}`}
         >
           Open ↗
-        </a>
+        </a>}
       </div>
       <ul className="space-y-1">
         {group.chunks.slice(0, 4).map((chunk) => {
-          const deepUrl = sourceUrl(apiBase, chunk.source, chunk.modality, chunk.page, chunk.timestamp)
-          const locator = chunk.page != null
-            ? `p. ${chunk.page}`
-            : chunk.timestamp
-              ? `@ ${chunk.timestamp}`
-              : null
+          const full = evidenceWithContext(chunk)
+          const deepUrl = sourceUrl(full.source, full.modality, full.page, full.timestamp)
+          const locator = sourceLocation(full)
+          const expanded = expandedChunkId === chunk.id
           return (
             <li key={chunk.id} className={`${isDark ? 'text-slate-400' : 'text-slate-600'}`}>
               <div className="flex items-baseline gap-1.5">
@@ -584,8 +592,11 @@ function SourceCard({
                     {locator}
                   </a>
                 )}
-                <span className="line-clamp-2 text-[11px] leading-snug">{chunk.text}</span>
+                {!expanded && <span className="line-clamp-2 text-[11px] leading-snug">{full.text}</span>}
               </div>
+              {expanded && <RichText text={full.text} className="text-xs leading-relaxed whitespace-pre-wrap mt-2" />}
+              <button aria-expanded={expanded} className="mt-1 text-[11px] underline underline-offset-2" onClick={() => setExpandedChunkId(expanded ? null : chunk.id)}>{expanded ? 'Collapse passage' : 'Show full passage'}</button>
+              <button className="mt-1 ml-3 text-[11px] underline underline-offset-2" onClick={() => openSourceEvidence(chunk)}>View in source</button>
             </li>
           )
         })}

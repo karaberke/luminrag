@@ -29,6 +29,7 @@ import json
 import logging
 import re
 
+from backend.llm import structured
 from backend.schemas import ReflectionVerdict, RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -165,41 +166,20 @@ def _parse_verdict(response: str) -> ReflectionVerdict:
 # ---------------------------------------------------------------------------
 
 def _call_ollama(prompt: str, cfg: dict) -> str:
-    import httpx
-
-    payload = {
-        "model": cfg.get("ollama_model", "llama3.2:3b"),
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"num_predict": cfg.get("max_tokens", 256)},
-    }
-    base_url = cfg.get("ollama_base_url", "http://localhost:11434")
-    response = httpx.post(f"{base_url}/api/generate", json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json()["response"]
+    return structured(prompt, {**cfg, "provider": "ollama"}, ReflectionVerdict).model_dump_json()
 
 
 def _call_anthropic(prompt: str, cfg: dict) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=cfg.get("anthropic_model", "claude-haiku-4-5-20251001"),
-        max_tokens=cfg.get("max_tokens", 256),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
+    return structured(prompt, {**cfg, "provider": "anthropic"}, ReflectionVerdict).model_dump_json()
 
 
 def _call_llm(prompt: str, cfg: dict) -> str:
-    """Dispatch to the configured LLM provider."""
     provider = cfg.get("provider", "ollama")
     if provider == "ollama":
         return _call_ollama(prompt, cfg)
     if provider == "anthropic":
         return _call_anthropic(prompt, cfg)
-    raise ValueError(f"Unknown self_rag provider: '{provider}'")
+    return structured(prompt, cfg, ReflectionVerdict).model_dump_json()
 
 
 # ---------------------------------------------------------------------------

@@ -14,16 +14,33 @@ Public API:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import BaseModel, Field
 
 from backend.graph._llm import resolve_synonym, safe_call_json
-from backend.graph.schema import ContentProposal, Illustration
+from backend.graph.schema import ContentProposal, ContentType, Illustration
 from backend.schemas import Chunk
 
 if TYPE_CHECKING:
     from backend.retrieval.embedder import Embedder
 
 logger = logging.getLogger(__name__)
+
+
+class _ContentPayload(BaseModel):
+    title: str = Field(min_length=1)
+    content_type: ContentType
+    summary: str
+    raw_excerpt: str
+    key_terms: list[str]
+    parent_subtopic: str
+    illustration_kind: Literal["diagram", "equation", "code", "image", ""]
+    illustration_hint: str
+
+
+class _ContentItems(BaseModel):
+    items: list[_ContentPayload]
 
 
 _CONTENT_TYPES = {"definition", "theorem", "technique", "example", "question", "figure", "other"}
@@ -160,7 +177,7 @@ def synthesize_contents(
         text=_esc(chunk.text[:_MAX_TEXT_CHARS]),
         max_per_chunk=max_per_chunk,
     )
-    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2000))
+    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2000), response_model=_ContentItems)
 
     proposals: list[ContentProposal] = []
     for entry in raw[:max_per_chunk]:

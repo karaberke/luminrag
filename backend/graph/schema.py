@@ -6,7 +6,7 @@ objects used by the hierarchical Topic → Subtopic → Content graph.
 
 Node types:   topic | subtopic | content
 Structural edges:  HAS_SUBTOPIC, HAS_CONTENT
-Semantic edges:    RELATED_TO  (carries a free-form label + confidence)
+Semantic edges:    RELATED_TO  (plain association with independent backing)
 
 Stage 1 extractors emit the *Proposal classes. Stage 2 (GraphBuilder.apply_proposals)
 resolves display names to stable keys and performs dedup/merge against the
@@ -23,7 +23,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-NodeType = Literal["topic", "subtopic", "content"]
+NodeType = Literal["topic", "subtopic", "content", "note"]
 TopicScope = Literal["broad", "narrow"]
 ContentType = Literal[
     "definition", "theorem", "technique", "example", "question", "figure", "other"
@@ -117,7 +117,17 @@ class ContentAttrs(_NodeAttrsBase):
     parent_subtopic_keys: list[str] = Field(default_factory=list)
 
 
-NodeAttrs = TopicAttrs | SubtopicAttrs | ContentAttrs
+class NoteAttrs(_NodeAttrsBase):
+    node_type: Literal["note"] = "note"
+    origin: Literal["ingested", "manual"] = "manual"
+    title: str = ""
+    body: str = ""
+    summary: str = ""
+    x: float | None = None
+    y: float | None = None
+
+
+NodeAttrs = TopicAttrs | SubtopicAttrs | ContentAttrs | NoteAttrs
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +169,10 @@ class RelatedToProposal(BaseModel):
 
     source_key: str
     target_key: str
-    label: str
-    confidence: float = 0.5
+    label: str | None = None  # Accepted from legacy callers; never used as a predicate.
+    confidence: float = Field(default=0.5, ge=0, le=1, allow_inf_nan=False)
     source_chunk_ids: list[str] = Field(default_factory=list)
+    verified: bool = False
 
 
 class ProposalBundle(BaseModel):

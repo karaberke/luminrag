@@ -1,0 +1,30 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: luminrag
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '1'
+        # Background ingestion continues after the initial 202 response.
+        run.googleapis.com/cpu-throttling: 'false'
+    spec:
+      containerConcurrency: 8
+      timeoutSeconds: 900
+      containers:
+        - image: REPLACE_WITH_ARTIFACT_REGISTRY_IMAGE
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              cpu: '1'
+              memory: 2Gi
+          env:
+            - name: LUMIN_HOSTED
+              value: '1'
+            - name: ALLOWED_ORIGINS
+              value: https://REPLACE_WITH_FRONTEND.pages.dev
+            - name: LUMIN_MAX_WORKSPACES
+              value: '2'

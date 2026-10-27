@@ -8,6 +8,11 @@ extractor migration. NER backends are mocked — no model downloads.
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+from types import ModuleType
+from pathlib import Path
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -17,6 +22,17 @@ from backend.graph.entity_extractor import (
     SpacyBackend,
     build_ner_backend,
 )
+
+
+@pytest.fixture(autouse=True)
+def optional_ner_modules(monkeypatch):
+    """Test only the optional-provider boundary; no heavyweight install is needed."""
+    gliner = ModuleType("gliner")
+    gliner.GLiNER = MagicMock()
+    spacy = ModuleType("spacy")
+    spacy.load = MagicMock()
+    monkeypatch.setitem(sys.modules, "gliner", gliner)
+    monkeypatch.setitem(sys.modules, "spacy", spacy)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +93,15 @@ class TestGLiNERBackend:
         assert len(segments) > 1
         assert all(len(s) <= ner._MAX_CHARS + 1 for s in segments)
 
+    def test_early_boundary_with_overlap_always_progresses(self):
+        ner = GLiNERBackend("m", ["concept"], 0.5)
+        text = "x\n" + "a" * 1500
+        segments = ner._split(text)
+        assert len(segments) <= 4
+        assert all(0 < len(segment) <= ner._MAX_CHARS for segment in segments)
+        assert segments[0].startswith("x\n")
+        assert segments[-1].endswith("a" * 100)
+
 
 # ---------------------------------------------------------------------------
 # spaCy backend
@@ -102,3 +127,20 @@ class TestBaseNER:
     def test_base_is_abstract(self):
         with pytest.raises(TypeError):
             BaseNER()  # type: ignore[abstract]
+
+
+@pytest.mark.parametrize("module,backend,args", [
+    ("gliner", GLiNERBackend, ("m", ["concept"], 0.5)),
+    ("spacy", SpacyBackend, ("m",)),
+])
+def test_missing_optional_backend_explains_hashed_install(monkeypatch, module, backend, args):
+    monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(RuntimeError, match="optional.*requirements-ner.lock"):
+        backend(*args)
+
+
+def test_importing_ner_helper_does_not_import_optional_model_libraries():
+    result = subprocess.run([sys.executable, "-c", "import sys; import backend.graph.entity_extractor; assert 'gliner' not in sys.modules; assert 'spacy' not in sys.modules; assert 'torch' not in sys.modules"],
+                            cwd=Path(__file__).resolve().parents[2], env={**os.environ, "LUMINRAG_SKIP_DOTENV": "1"},
+                            capture_output=True, timeout=15)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")

@@ -1,240 +1,510 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
-import type { EvidenceChunk, GraphData, GraphEdge, GraphNode, Message } from './types'
+import BrandMark from './components/BrandMark'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { EvidenceChunk, GraphData, GraphNode, Message, NodeType } from './types'
 const GraphPanel = lazy(() => import('./components/GraphPanel'))
+const SourceViewer = lazy(() => import('./components/source/SourceViewer'))
 import MessageBubble from './components/MessageBubble'
-import QueryInput, { type RoutingMode } from './components/QueryInput'
+import QueryInput from './components/QueryInput'
 import NodeDetailPanel from './components/NodeDetailPanel'
 import UploadModal from './components/UploadModal'
-import PaperView from './components/PaperView'
-import QuizPanel from './components/QuizPanel'
-import { useTheme } from './ThemeContext'
+import AccessGate from './components/AccessGate'
+import SettingsModal from './components/SettingsModal'
+import WorkspaceToolbar from './components/WorkspaceToolbar'
+import { useTheme } from './theme'
+import {
+  ApiError,
+  apiFetch,
+  apiJson,
+  apiRequest,
+  errorMessage,
+  isAbortError,
+  isAuthError,
+} from './utils/api'
+import { endSession, fetchAuthStatus, observeSessionStatus } from './utils/auth'
+import { applyNodeUpdates, evidenceForNode, highlightGraphTrace, type NodeEvidenceState } from './utils/graph'
+import { activeWorkspaceId, clearWorkspaceData, db, settleIngestOriginals } from './storage/db'
+import { restoreSelectedWorkspace, scheduleWorkspaceSave } from './utils/workspaces'
+import { finishOpenRouterConnection, getLlmSettings, loadLlmSettings } from './utils/settings'
+import { applyGraphOps, resetGraphHistory } from './components/graph/useGraphStore'
+import { DEFAULT_QUERY_SETTINGS, queryWorkspace, type QuerySettings } from './utils/query'
+import { ASSOCIATION_VERSION, normalizeGraphConnections } from './utils/connections'
 
-type View = 'chat' | 'paper' | 'quiz'
+/** connecting: waking server / checking status · locked: access key needed · error: status check failed */
+type AuthPhase = 'connecting' | 'locked' | 'error' | 'ready'
 
-const EMPTY_GRAPH: GraphData = { nodes: [], edges: [] }
-const API_BASE = import.meta.env.VITE_API_URL ?? ''
+interface IngestJobState {
+  id: string
+  stage: string
+  failed?: boolean
+}
+
+interface AddNodePayload {
+  name: string
+  node_type: NodeType
+  body?: string
+  x?: number
+  y?: number
+  summary?: string
+  scope?: 'broad' | 'narrow'
+  content_type?: string
+  summary_beginner?: string
+  summary_intermediate?: string
+  summary_expert?: string
+  parent_topic_keys?: string[]
+  parent_subtopic_keys?: string[]
+}
+
+const EMPTY_GRAPH: GraphData = { nodes: [], edges: [], association_version: ASSOCIATION_VERSION }
 const INGEST_JOB_KEY = 'lumin-ingest-job'
-
-
+const ingestJobKey = () => `${INGEST_JOB_KEY}:${activeWorkspaceId()}`
+const HEALTH_TIMEOUT_MS = 10_000
+const HEALTH_RETRY_MS = 3000
 
 function generateId() {
   return Math.random().toString(36).slice(2)
 }
 
-async function realQuery(
-  query: string,
-  routingMode: RoutingMode,
-  maxSources?: number,
-  minRelevancy?: number,
-): Promise<Omit<Message, 'id' | 'timestamp'>> {
-  const body: Record<string, string | number> = { query }
-  if (routingMode !== 'auto') body.routing_mode = routingMode
-  if (maxSources !== undefined) body.max_sources = maxSources
-  if (minRelevancy !== undefined && minRelevancy > 0) body.min_relevancy = minRelevancy
-  const res = await fetch(`${API_BASE}/api/query`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`Backend error ${res.status}: ${text}`)
+function unhighlighted(data: GraphData): GraphData {
+  return {
+    ...data,
+    nodes: data.nodes.map((n) => ({ ...n, highlighted: false })),
+    edges: data.edges.map((e) => ({ ...e, highlighted: false })),
   }
-  return res.json()
 }
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
+  const [workspaceId, setWorkspaceId] = useState(activeWorkspaceId)
+  const [messagesLoadedFor, setMessagesLoadedFor] = useState<string | null>(null)
+  const [hosted, setHosted] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [activeSource, setActiveSource] = useState<EvidenceChunk | null>(null)
+  const [providerReady, setProviderReady] = useState(false)
+  const [storageError, setStorageError] = useState<string | null>(null)
+  const [workspaceLoading, setWorkspaceLoading] = useState(true)
   const [graph, setGraph] = useState<GraphData>(EMPTY_GRAPH)
-  const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
-  const [selectedNodeEvidence, setSelectedNodeEvidence] = useState<EvidenceChunk[]>([])
-  const [selectedNodeLoading, setSelectedNodeLoading] = useState(false)
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [evidenceVersion, setEvidenceVersion] = useState(0)
+  const [evidenceState, setEvidenceState] = useState<NodeEvidenceState | null>(null)
   const [loading, setLoading] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [querySettings, setQuerySettings] = useState<QuerySettings>({ ...DEFAULT_QUERY_SETTINGS })
+  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === 'undefined' || window.innerWidth >= 768)
   const [maximized, setMaximized] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const [isGraphLoading, setIsGraphLoading] = useState(true)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
-  const [backendReady, setBackendReady] = useState(false)
+  const [clearDataOpen, setClearDataOpen] = useState(false)
+  const [authPhase, setAuthPhase] = useState<AuthPhase>('connecting')
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [tokenRequired, setTokenRequired] = useState(false)
+  const [connectAttempt, setConnectAttempt] = useState(0)
   const [wakingUp, setWakingUp] = useState(false)
   const [editMode, setEditMode] = useState(false)
   const [suggestions, setSuggestions] = useState<string[]>([])
-  const [view, setView] = useState<View>('chat')
-  const [ingestJob, setIngestJob] = useState<{ id: string; stage: string } | null>(() =>
-    localStorage.getItem(INGEST_JOB_KEY) ? { id: localStorage.getItem(INGEST_JOB_KEY)!, stage: 'Connecting…' } : null
-  )
+  const [ingestJob, setIngestJob] = useState<IngestJobState | null>(() => {
+    const id = localStorage.getItem(ingestJobKey())
+    return id ? { id, stage: 'Connecting…' } : null
+  })
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const baseGraphRef = useRef<GraphData>(EMPTY_GRAPH)
   const nodeDetailRef = useRef<HTMLDivElement>(null)
-  const ingestPollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const graphLoadRef = useRef<AbortController | null>(null)
+  const suggestionsLoadRef = useRef<AbortController | null>(null)
+  const queryAbortRef = useRef<AbortController | null>(null)
+  const previousWorkspaceRef = useRef<string | null>(null)
   const { theme, toggleTheme } = useTheme()
   const isDark = theme === 'dark'
+  const canConnect = authPhase === 'ready' && (!hosted || providerReady)
+  const isReady = canConnect && !workspaceLoading
 
-  // Poll /api/health until the backend responds, then load the graph
+  useEffect(() => {
+    let disposed = false
+    loadLlmSettings().then(() => finishOpenRouterConnection()).then(() => {
+      if (!disposed) { setProviderReady(!!getLlmSettings().key); setWorkspaceId(activeWorkspaceId()) }
+    }).catch((error) => { if (!disposed) { setStorageError(errorMessage(error)); setSettingsOpen(true) } })
+    const settings = () => { setProviderReady(!!getLlmSettings().key) }
+    const failure = (event: Event) => setStorageError(String((event as CustomEvent).detail))
+    const save = (event: Event) => scheduleWorkspaceSave((event as CustomEvent<string>).detail)
+    const source = (event: Event) => setActiveSource((event as CustomEvent<EvidenceChunk>).detail)
+    window.addEventListener('lumin-settings-changed', settings)
+    window.addEventListener('lumin-storage-error', failure)
+    window.addEventListener('lumin-workspace-mutated', save)
+    window.addEventListener('lumin-open-source', source)
+    return () => { disposed = true; window.removeEventListener('lumin-settings-changed', settings); window.removeEventListener('lumin-storage-error', failure); window.removeEventListener('lumin-workspace-mutated', save); window.removeEventListener('lumin-open-source', source) }
+  }, [])
+
+  const cancelGraphLoad = useCallback(() => {
+    graphLoadRef.current?.abort()
+    graphLoadRef.current = null
+    setIsGraphLoading(false)
+  }, [])
+
+  const cancelActiveQuery = useCallback(() => {
+    queryAbortRef.current?.abort()
+    queryAbortRef.current = null
+    setLoading(false)
+  }, [])
+
+  // Expiry, disconnect and dataset deletion all discard the same protected state.
+  const resetLoadedData = useCallback(() => {
+    cancelGraphLoad()
+    suggestionsLoadRef.current?.abort()
+    suggestionsLoadRef.current = null
+    cancelActiveQuery()
+    setSuggestions([])
+    localStorage.removeItem(ingestJobKey())
+    setIngestJob(null)
+    setUploadOpen(false)
+    setActiveSource(null)
+    setEvidenceState(null)
+    setEditMode(false)
+    setMessages([])
+    setGraph(EMPTY_GRAPH)
+    baseGraphRef.current = EMPTY_GRAPH
+    setSelectedNodeId(null)
+  }, [cancelGraphLoad, cancelActiveQuery])
+
+  useEffect(() => () => {
+    graphLoadRef.current?.abort()
+    suggestionsLoadRef.current?.abort()
+    queryAbortRef.current?.abort()
+    graphLoadRef.current = null
+    suggestionsLoadRef.current = null
+    queryAbortRef.current = null
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Connection + auth: poll /api/health until the server is awake, then ask
+  // /api/auth/status whether we need an access key before loading anything.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false
-    let timer: ReturnType<typeof setTimeout>
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let pingController: AbortController | null = null
+    const statusController = new AbortController()
+
+    const checkStatus = async () => {
+      try {
+        const status = await fetchAuthStatus(statusController.signal)
+        if (cancelled) return
+        setTokenRequired(status.token_required)
+        setAuthError(null)
+        if (!status.authenticated) resetLoadedData()
+        setAuthPhase(status.authenticated ? 'ready' : 'locked')
+      } catch (e) {
+        if (cancelled || isAbortError(e)) return
+        if (e instanceof ApiError && e.status === 404) {
+          // Server predates the auth endpoints — no access control to satisfy
+          setAuthPhase('ready')
+          return
+        }
+        setAuthError(`Could not check access status: ${errorMessage(e)}`)
+        setAuthPhase('error')
+      }
+    }
 
     const ping = async () => {
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 10_000)
+      pingController = controller
+      const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS)
+      let awake = false
       try {
-        const res = await fetch(`${API_BASE}/api/health`, {
+        const res = await apiFetch('/api/health', {
           cache: 'no-store',
           signal: controller.signal,
+          skipAuthCheck: true,
         })
-        if (res.ok && !cancelled) {
-          setBackendReady(true)
-          setWakingUp(false)
-          return
-        }
+        if (res.ok) { const health = await res.json(); setHosted(Boolean(health.features?.hosted ?? health.hosted)) }
+        // An auth rejection also proves the server is up — never keep polling on 401/403
+        awake = res.ok || res.status === 401 || res.status === 403
       } catch {
         // server not yet up (or timed out) — retry
       } finally {
         clearTimeout(timeout)
       }
-      if (!cancelled) {
-        setWakingUp(true)
-        timer = setTimeout(ping, 3000)
+      if (cancelled) return
+      if (awake) {
+        setWakingUp(false)
+        await checkStatus()
+        return
       }
+      setWakingUp(true)
+      timer = setTimeout(ping, HEALTH_RETRY_MS)
     }
 
     ping()
-    return () => { cancelled = true; clearTimeout(timer) }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+      pingController?.abort()
+      statusController.abort()
+    }
+  }, [connectAttempt, resetLoadedData])
 
-  const loadGraph = () => {
-    setIsGraphLoading(true)
-    fetch(`${API_BASE}/api/graph`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Graph fetch failed: ${res.status}`)
-        return res.json() as Promise<GraphData>
-      })
-      .then((data) => {
-        if (data.nodes.length > 0) {
-          const unhighlighted: GraphData = {
-            nodes: data.nodes.map((n) => ({ ...n, highlighted: false })),
-            edges: data.edges.map((e) => ({ ...e, highlighted: false })),
-          }
-          baseGraphRef.current = unhighlighted
-          setGraph(unhighlighted)
+  const retryConnect = () => {
+    setAuthError(null)
+    setAuthPhase('connecting')
+    setConnectAttempt((n) => n + 1)
+  }
+
+  // A protected request returned 401/403 — re-check the session and show the
+  // access screen if it has expired. One check at a time; never loops.
+  useEffect(() => {
+    if (!isReady) return
+    return observeSessionStatus(
+      (status) => {
+        setTokenRequired(status.token_required)
+        if (!status.authenticated) {
+          resetLoadedData()
+          setAuthPhase('locked')
         }
+      },
+      (error) => { console.warn('Auth re-check failed:', error) },
+    )
+  }, [isReady, resetLoadedData])
+
+  // ---------------------------------------------------------------------------
+  // Graph + suggestions. Each load supersedes (aborts) the previous one so a
+  // slow, stale response can never overwrite a newer graph or a clear.
+  // ---------------------------------------------------------------------------
+  const loadGraph = useCallback(() => {
+    graphLoadRef.current?.abort()
+    const controller = new AbortController()
+    graphLoadRef.current = controller
+    return apiJson<GraphData>('/api/graph', { signal: controller.signal, cache: 'no-store' })
+      .then(async (data) => {
+        const normalized = await normalizeGraphConnections(data)
+        if (controller.signal.aborted) return
+        const next = normalized.nodes.length > 0 ? unhighlighted(normalized) : EMPTY_GRAPH
+        // Old inverse operations can refer to removed parallel edge identities.
+        if (baseGraphRef.current.association_version !== next.association_version) resetGraphHistory()
+        baseGraphRef.current = next
+        setGraph(next)
+        setSelectedNodeId((id) => id && next.nodes.some((node) => node.id === id) ? id : null)
+        setEvidenceVersion((version) => version + 1)
+        return true
       })
       .catch((err) => {
-        console.warn('Could not load graph from backend:', err)
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          console.warn('Could not load graph from backend:', err)
+        }
+        return false
       })
-      .finally(() => setIsGraphLoading(false))
+      .finally(() => {
+        if (graphLoadRef.current === controller) {
+          graphLoadRef.current = null
+          setIsGraphLoading(false)
+        }
+      })
+  }, [])
+
+  const loadSuggestions = useCallback(() => {
+    suggestionsLoadRef.current?.abort()
+    const controller = new AbortController()
+    suggestionsLoadRef.current = controller
+    return apiJson<string[]>('/api/suggestions', { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setSuggestions(Array.isArray(data) ? data : [])
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setSuggestions([])
+      })
+  }, [])
+
+  const clearChat = () => {
+    cancelActiveQuery()
+    setMessages([])
+    setGraph(baseGraphRef.current)
+    setSelectedNodeId(null)
   }
 
-  const loadSuggestions = () => {
-    fetch(`${API_BASE}/api/suggestions`)
-      .then((res) => (res.ok ? res.json() as Promise<string[]> : Promise.resolve([])))
-      .then(setSuggestions)
-      .catch(() => {})
-  }
-
-  // Load the graph and suggestions once the backend is confirmed ready
+  // Restore the browser's workspace before protected reads, including after a server restart.
   useEffect(() => {
-    if (backendReady) {
-      loadGraph()
-      loadSuggestions()
+    if (!canConnect) return
+    let cancelled = false
+    setIsGraphLoading(true)
+    restoreSelectedWorkspace(previousWorkspaceRef.current, hosted).then(async (id) => {
+      if (cancelled || id !== activeWorkspaceId()) return
+      previousWorkspaceRef.current = id
+      setWorkspaceId(id)
+      const saved = await db.chats.get(id)
+      if (cancelled) return
+      setMessages((saved?.messages ?? []).map((message) => ({ ...message, timestamp: new Date(message.timestamp) })))
+      setMessagesLoadedFor(id)
+      setWorkspaceLoading(false)
+      const savedJob = localStorage.getItem(ingestJobKey())
+      if (savedJob) setIngestJob({ id: savedJob, stage: 'Connecting…' })
+      loadGraph(); loadSuggestions()
+    }).catch((error) => { if (!cancelled) { setStorageError(errorMessage(error)); setIsGraphLoading(false); setWorkspaceLoading(false) } })
+    return () => { cancelled = true }
+  }, [canConnect, workspaceId, hosted, loadGraph, loadSuggestions])
+
+  useEffect(() => {
+    const changing = () => { cancelActiveQuery(); cancelGraphLoad(); setActiveSource(null); setWorkspaceLoading(true) }
+    const ended = () => setWorkspaceLoading(false)
+    const change = () => {
+      cancelGraphLoad(); cancelActiveQuery(); suggestionsLoadRef.current?.abort()
+      setMessagesLoadedFor(null); setMessages([]); setGraph(EMPTY_GRAPH); baseGraphRef.current = EMPTY_GRAPH
+      setWorkspaceLoading(true)
+      setSelectedNodeId(null); setEvidenceState(null); setSuggestions([]); setIngestJob(null)
+      setActiveSource(null)
+      setWorkspaceId(activeWorkspaceId()); resetGraphHistory()
     }
-  }, [backendReady]) // eslint-disable-line react-hooks/exhaustive-deps
+    const graphChanged = () => { loadGraph() }
+    const assetsChanged = () => setEvidenceVersion((version) => version + 1)
+    window.addEventListener('lumin-workspace-changed', change)
+    window.addEventListener('lumin-workspace-changing', changing)
+    window.addEventListener('lumin-workspace-transition-ended', ended)
+    window.addEventListener('lumin-graph-changed', graphChanged)
+    window.addEventListener('lumin-assets-updated', assetsChanged)
+    return () => { window.removeEventListener('lumin-workspace-changed', change); window.removeEventListener('lumin-workspace-changing', changing); window.removeEventListener('lumin-workspace-transition-ended', ended); window.removeEventListener('lumin-graph-changed', graphChanged); window.removeEventListener('lumin-assets-updated', assetsChanged) }
+  }, [cancelGraphLoad, cancelActiveQuery, loadGraph])
+
+  useEffect(() => {
+    if (!workspaceId || messagesLoadedFor !== workspaceId) return
+    const timer = setTimeout(() => { db.chats.put({ workspaceId, messages }).catch((error) => setStorageError(errorMessage(error))) }, 150)
+    return () => clearTimeout(timer)
+  }, [messages, messagesLoadedFor, workspaceId])
 
   // ---------------------------------------------------------------------------
   // Background ingest-job polling — persisted via localStorage so it survives
-  // tab closes and modal unmounts.
+  // tab closes and modal unmounts. Paused while access is not confirmed.
   // ---------------------------------------------------------------------------
+  const pollingJobId = ingestJob && !ingestJob.failed ? ingestJob.id : null
 
-  const startPolling = (jobId: string) => {
-    fetch(`${API_BASE}/api/ingest/jobs/${jobId}`)
-      .then((res) => {
+  useEffect(() => {
+    if (!pollingJobId || !isReady) return
+    const pollingWorkspaceId = workspaceId
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`/api/ingest/jobs/${encodeURIComponent(pollingJobId)}`, {
+          signal: controller.signal,
+          cache: 'no-store',
+          workspaceId: pollingWorkspaceId,
+        })
         if (res.status === 404) {
-          // Backend restarted — job gone; silently clear
-          localStorage.removeItem(INGEST_JOB_KEY)
+          // A missing job has no reliable completion outcome; keep committed originals.
+          const originals = await settleIngestOriginals(pollingJobId, null, pollingWorkspaceId)
+          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
+          if (originals === 'discarded') setStorageError('This upload\'s final status is unavailable. Saved originals were not replaced. Re-upload the files to finish processing and refresh their previews.')
+          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
           setIngestJob(null)
-          return null
+          return
         }
-        return res.ok ? res.json() : Promise.reject(new Error(`${res.status}`))
-      })
-      .then((job) => {
-        if (!job) return
+        if (!res.ok) throw new ApiError(res.status, res.statusText)
+        const job: { status: string; progress_stage?: string; error?: string | null; result?: { ingested_source_ids?: string[]; failed?: string[] } } = await res.json()
+        if (controller.signal.aborted) return
         if (job.status === 'done') {
-          localStorage.removeItem(INGEST_JOB_KEY)
+          const committedSources = job.result?.ingested_source_ids
+          const originals = await settleIngestOriginals(pollingJobId, committedSources, pollingWorkspaceId)
+          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
+          if (originals === 'discarded' && !Array.isArray(committedSources)) setStorageError('This server did not confirm which files were processed. Saved originals were not replaced. Update the server and re-upload the files to refresh their previews.')
+          else if (job.result?.failed?.length) setStorageError(`Some files could not be processed: ${job.result.failed.join(', ')}. Their saved originals were kept. Re-upload those files to try again.`)
+          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
           setIngestJob(null)
           loadGraph()
           loadSuggestions()
-        } else if (job.status === 'failed') {
-          localStorage.removeItem(INGEST_JOB_KEY)
-          setIngestJob({ id: jobId, stage: `Failed: ${job.error ?? 'unknown error'}` })
-          ingestPollRef.current = setTimeout(() => setIngestJob(null), 8000)
+          scheduleWorkspaceSave()
+        } else if (job.status === 'failed' || job.status === 'cancelled') {
+          await settleIngestOriginals(pollingJobId, null, pollingWorkspaceId)
+          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
+          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
+          const reason = job.status === 'cancelled' ? 'Ingestion cancelled because the data was cleared.' : `Failed: ${job.error ?? 'unknown error'}`
+          setIngestJob({ id: pollingJobId, stage: reason, failed: true })
         } else {
-          setIngestJob({ id: jobId, stage: job.progress_stage || 'Processing…' })
-          ingestPollRef.current = setTimeout(() => startPolling(jobId), 3000)
+          setIngestJob({ id: pollingJobId, stage: job.progress_stage || 'Processing…' })
+          timer = setTimeout(poll, 3000)
         }
-      })
-      .catch(() => {
+      } catch (err) {
+        if (controller.signal.aborted || isAbortError(err)) return
+        // Auth problems are handled by the access gate; polling resumes once ready again
+        if (isAuthError(err)) return
         // Network hiccup — retry
-        ingestPollRef.current = setTimeout(() => startPolling(jobId), 5000)
-      })
-  }
+        timer = setTimeout(poll, 5000)
+      }
+    }
 
-  // Resume polling on mount if a job was in-flight when the tab was closed
+    poll()
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [pollingJobId, isReady, workspaceId, loadGraph, loadSuggestions])
+
+  // Hide a failed-job notice after a few seconds
+  const ingestFailed = ingestJob?.failed ?? false
   useEffect(() => {
-    const saved = localStorage.getItem(INGEST_JOB_KEY)
-    if (saved) startPolling(saved)
-    return () => { if (ingestPollRef.current) clearTimeout(ingestPollRef.current) }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    if (!ingestFailed) return
+    const t = setTimeout(() => setIngestJob(null), 8000)
+    return () => clearTimeout(t)
+  }, [ingestFailed])
 
   // Multi-tab sync: if another tab finishes/clears the job, stop polling here too
   useEffect(() => {
     const handler = (e: StorageEvent) => {
-      if (e.key === INGEST_JOB_KEY && e.newValue === null) {
-        if (ingestPollRef.current) clearTimeout(ingestPollRef.current)
+      if (e.key === ingestJobKey() && e.newValue === null) {
         setIngestJob(null)
-        loadGraph()
-        loadSuggestions()
+        if (isReady) {
+          loadGraph()
+          loadSuggestions()
+        }
       }
     }
     window.addEventListener('storage', handler)
     return () => window.removeEventListener('storage', handler)
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isReady, loadGraph, loadSuggestions])
 
-  const handleJobStarted = (jobId: string) => {
-    if (ingestPollRef.current) clearTimeout(ingestPollRef.current)
-    localStorage.setItem(INGEST_JOB_KEY, jobId)
-    setIngestJob({ id: jobId, stage: 'Queued…' })
-    setUploadOpen(false)
-    startPolling(jobId)
-  }
+  const handleJobStarted = useCallback((jobId: string, ownerWorkspace = activeWorkspaceId()) => {
+    localStorage.setItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`, jobId)
+    if (ownerWorkspace === activeWorkspaceId()) setIngestJob({ id: jobId, stage: 'Queued…' })
+  }, [])
+
+  const closeUpload = useCallback(() => setUploadOpen(false), [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // ---------------------------------------------------------------------------
+  // Selection — only the id is stored; the node itself is always read from the
+  // latest graph so edits are reflected immediately.
+  // ---------------------------------------------------------------------------
+  const selectedNode = useMemo(
+    () => (selectedNodeId ? graph.nodes.find((n) => n.id === selectedNodeId) ?? null : null),
+    [graph.nodes, selectedNodeId],
+  )
+
   const handleNodeClick = (node: GraphNode) => {
-    setSelectedNode((prev) => (prev?.id === node.id ? null : node))
+    setSelectedNodeId((prev) => (prev === node.id ? null : node.id))
   }
 
   // Fetch the rich detail (including the evidence trail joined from SQLite)
-  // whenever the selected node changes.
+  // whenever the selected node changes or is edited.
   useEffect(() => {
-    if (!selectedNode) {
-      setSelectedNodeEvidence([])
-      return
-    }
-    let cancelled = false
-    setSelectedNodeLoading(true)
-    fetch(`${API_BASE}/api/graph/node/${encodeURIComponent(selectedNode.id)}`)
-      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
-      .then((data: { evidence?: EvidenceChunk[] }) => {
-        if (!cancelled) setSelectedNodeEvidence(data.evidence ?? [])
+    if (!selectedNodeId || !isReady) return
+    const controller = new AbortController()
+    const settle = (evidence: EvidenceChunk[]) =>
+      setEvidenceState({ nodeId: selectedNodeId, version: evidenceVersion, evidence })
+    apiJson<{ evidence?: EvidenceChunk[] }>(`/api/graph/node/${encodeURIComponent(selectedNodeId)}`, {
+      signal: controller.signal,
+    })
+      .then((data) => {
+        if (!controller.signal.aborted) settle(data.evidence ?? [])
       })
-      .catch(() => { if (!cancelled) setSelectedNodeEvidence([]) })
-      .finally(() => { if (!cancelled) setSelectedNodeLoading(false) })
-    return () => { cancelled = true }
-  }, [selectedNode])
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) settle([])
+      })
+    return () => controller.abort()
+  }, [selectedNodeId, evidenceVersion, isReady])
+
+  const selectedNodeEvidence = evidenceForNode(evidenceState, selectedNodeId, evidenceVersion)
+  const selectedNodeLoading =
+    selectedNodeId !== null &&
+    (!evidenceState || evidenceState.nodeId !== selectedNodeId || evidenceState.version !== evidenceVersion)
 
   const handleFirstKeystroke = () => {
     setGraph((prev) => {
@@ -246,7 +516,11 @@ export default function App() {
     })
   }
 
-  const handleQuery = async (query: string, routingMode: RoutingMode = 'auto', maxSources?: number, minRelevancy?: number) => {
+  const handleQuery = async (query: string) => {
+    if (!isReady || clearing) return
+    queryAbortRef.current?.abort()
+    const controller = new AbortController()
+    queryAbortRef.current = controller
     const userMsg: Message = {
       id: generateId(),
       role: 'user',
@@ -258,196 +532,116 @@ export default function App() {
     setGraph(baseGraphRef.current)
 
     try {
-      const result = await realQuery(query, routingMode, maxSources, minRelevancy)
+      const result = await queryWorkspace(query, { ...querySettings, signal: controller.signal })
+      if (controller.signal.aborted) return
       const assistantMsg: Message = { id: generateId(), timestamp: new Date(), ...result }
       setMessages((prev) => [...prev, assistantMsg])
-      if (result.hops && result.hops.length > 0) {
-        const hopIndex = new Map(result.hops.map((id, i) => [id, i]))
-        setGraph({
-          nodes: baseGraphRef.current.nodes.map((n: GraphNode) => ({
-            ...n,
-            highlighted: hopIndex.has(n.id),
-            hopIndex: hopIndex.get(n.id),
-          })),
-          edges: baseGraphRef.current.edges.map((e: GraphEdge) => ({
-            ...e,
-            highlighted: hopIndex.has(e.source) && hopIndex.has(e.target),
-          })),
-        })
-      }
-    } catch {
+      setGraph(highlightGraphTrace(baseGraphRef.current, result.hops ?? [], assistantMsg.id))
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) return
       setMessages((prev) => [
         ...prev,
         {
           id: generateId(),
           role: 'assistant',
-          content: 'Failed to get a response. Please check the backend is running.',
+          content: error instanceof ApiError && [409, 422, 429, 503].includes(error.status)
+            ? errorMessage(error)
+            : 'Failed to get a response. Please check the backend is running.',
           timestamp: new Date(),
         },
       ])
     } finally {
-      setLoading(false)
+      if (queryAbortRef.current === controller) {
+        queryAbortRef.current = null
+        setLoading(false)
+      }
     }
   }
 
   const handleClearData = async () => {
-    if (!window.confirm('This will permanently delete all chunks, the vector index, the concept graph, and all uploaded files. Continue?')) return
+    const ownerWorkspace = activeWorkspaceId()
+    setClearDataOpen(false)
     setClearing(true)
     try {
-      const res = await fetch(`${API_BASE}/api/data`, { method: 'DELETE' })
-      if (!res.ok) throw new Error(`Server error ${res.status}`)
-      setMessages([])
-      setGraph(EMPTY_GRAPH)
-      baseGraphRef.current = EMPTY_GRAPH
-      setSelectedNode(null)
+      await apiRequest('/api/data', { method: 'DELETE', workspaceId: ownerWorkspace })
+      await clearWorkspaceData(ownerWorkspace)
+      localStorage.removeItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`)
+      if (activeWorkspaceId() !== ownerWorkspace) return
+      resetGraphHistory()
+      resetLoadedData()
     } catch (e) {
-      alert(`Clear failed: ${e instanceof Error ? e.message : String(e)}`)
+      setStorageError(`Clear failed: ${errorMessage(e)}`)
     } finally {
       setClearing(false)
     }
+  }
+
+  const handleDisconnect = async () => {
+    try {
+      await endSession()
+    } catch (e) {
+      setStorageError(`Disconnect failed: ${errorMessage(e)}`)
+      return
+    }
+    resetLoadedData()
+    setAuthPhase('locked')
   }
 
   // ---------------------------------------------------------------------------
   // Graph edit handlers
   // ---------------------------------------------------------------------------
 
-  const handleAddNode = async (payload: {
-    name: string
-    node_type: 'topic' | 'subtopic' | 'content'
-    summary?: string
-    scope?: 'broad' | 'narrow'
-    content_type?: string
-    summary_beginner?: string
-    summary_intermediate?: string
-    summary_expert?: string
-    parent_topic_keys?: string[]
-    parent_subtopic_keys?: string[]
-  }) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/graph/node`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      if (!res.ok) {
-        const text = await res.text()
-        alert(`Add node failed: ${text}`)
-        return
-      }
-      loadGraph()
-    } catch (e) {
-      alert(`Add node failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
+  const handleAddNode = async (payload: AddNodePayload) => {
+    try { await applyGraphOps([{ op: 'add_node', node: { ...payload, id: crypto.randomUUID() } }]) }
+    catch (error) { setStorageError(errorMessage(error)) }
   }
 
-  const handleDeleteNode = async (nodeId: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/graph/node/${encodeURIComponent(nodeId)}`, { method: 'DELETE' })
-      if (!res.ok) {
-        const text = await res.text()
-        alert(`Delete node failed: ${text}`)
-        return
-      }
-      if (selectedNode?.id === nodeId) setSelectedNode(null)
-      loadGraph()
-    } catch (e) {
-      alert(`Delete node failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
+  const handleDeleteNode = async (id: string) => {
+    try { await applyGraphOps([{ op: 'delete_node', id }]); setSelectedNodeId(null) }
+    catch (error) { setStorageError(errorMessage(error)) }
   }
 
-  const handleUpdateNode = async (nodeId: string, updates: Record<string, unknown>) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/graph/node/${encodeURIComponent(nodeId)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      })
-      if (!res.ok) {
-        const text = await res.text()
-        alert(`Update node failed: ${text}`)
-        return
-      }
-      loadGraph()
-    } catch (e) {
-      alert(`Update node failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
+  const handleUpdateNode = async (id: string, updates: Record<string, unknown>) => {
+    await applyGraphOps([{ op: 'update_node', id, updates }])
+    baseGraphRef.current = applyNodeUpdates(baseGraphRef.current, id, updates)
+    setGraph((previous) => applyNodeUpdates(previous, id, updates))
+    setEvidenceVersion((version) => version + 1)
   }
 
-  const handleConnectNodes = async (
-    sourceId: string,
-    targetId: string,
-    relation: string,
-    label?: string,
-    confidence?: number,
-  ) => {
-    try {
-      const body: Record<string, unknown> = {
-        source: sourceId,
-        target: targetId,
-        relation,
-      }
-      if (label) body.label = label
-      if (confidence !== undefined) body.confidence = confidence
-      const res = await fetch(`${API_BASE}/api/graph/edge`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      if (!res.ok) {
-        const text = await res.text()
-        alert(`Add edge failed: ${text}`)
-        return
-      }
-      loadGraph()
-    } catch (e) {
-      alert(`Add edge failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
+  const handleConnectNodes = async (source: string, target: string, relation: string) => {
+    try { await applyGraphOps([{ op: 'add_edge', edge: { source, target, relation } }]) }
+    catch (error) { setStorageError(errorMessage(error)) }
   }
 
-  const handleDeleteEdge = async (
-    source: string,
-    relation: string,
-    target: string,
-    label?: string,
-  ) => {
-    try {
-      const params = new URLSearchParams({ source, relation, target })
-      if (label) params.set('label', label)
-      const res = await fetch(`${API_BASE}/api/graph/edge?${params}`, { method: 'DELETE' })
-      if (!res.ok) {
-        const text = await res.text()
-        alert(`Delete edge failed: ${text}`)
-        return
-      }
-      loadGraph()
-    } catch (e) {
-      alert(`Delete edge failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
+  const handleDeleteEdge = async (source: string, relation: string, target: string) => {
+    try { await applyGraphOps([{ op: 'delete_edge', source, relation, target }]) }
+    catch (error) { setStorageError(errorMessage(error)) }
   }
 
   return (
-    <div className={`flex h-screen overflow-hidden transition-colors duration-200 ${
-      isDark ? 'bg-slate-950 text-slate-200' : 'bg-[#f0f4ff] text-slate-800'
+    <div className={`lumin-shell flex h-screen overflow-hidden transition-colors duration-200 ${
+      isDark ? 'bg-slate-950 text-slate-200' : 'bg-[var(--lumin-background)] text-slate-800'
     }`}>
       {/* Sidebar — Graph Panel */}
       <aside
-        className={`flex flex-col overflow-hidden ${
-          view === 'paper' || view === 'quiz' ? 'hidden' : ''
-        } ${isDark ? 'bg-slate-900' : 'bg-[#f8faff]'} ${fullscreen
-          ? `fixed inset-0 z-50 w-screen ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'}`
-          : `border-r transition-all duration-300 shrink-0 ${isDark ? 'border-slate-800' : 'border-[#dde5f5]'} ${
-              sidebarOpen ? (maximized ? 'w-[55vw]' : 'w-80 xl:w-96') : 'w-0'
+        aria-hidden={!sidebarOpen && !fullscreen}
+        inert={!sidebarOpen && !fullscreen}
+        className={`lumin-graph-sidebar flex flex-col overflow-hidden ${isDark ? 'bg-slate-900' : 'bg-[var(--lumin-paper-soft)]'} ${fullscreen
+          ? `fixed inset-0 z-50 w-screen ${isDark ? 'border-slate-800' : 'border-[var(--lumin-border)]'}`
+          : `border-r transition-all duration-300 shrink-0 ${isDark ? 'border-slate-800' : 'border-[var(--lumin-border)]'} ${
+              sidebarOpen ? `${maximized ? 'w-[55vw]' : 'w-80 xl:w-96'} max-md:fixed max-md:inset-0 max-md:z-50 max-md:w-screen` : 'w-0'
             }`
         }`}
       >
         <div className={`flex-1 overflow-hidden flex flex-col ${
           fullscreen ? 'min-w-full' : maximized ? 'min-w-[55vw]' : 'min-w-80 xl:min-w-96'
-        }`}>
-          {isGraphLoading && (
+        } max-md:min-w-0 max-md:w-full`}>
+          <div className="md:hidden px-3 py-2 flex justify-between items-center border-b border-slate-500/20 text-xs"><span>Knowledge graph</span><button aria-label="Close graph" onClick={() => { setSidebarOpen(false); setFullscreen(false) }} className="px-2 py-1 rounded-lg border border-slate-500/30">Close ×</button></div>
+          {isReady && isGraphLoading && (
             <div className={`flex items-center justify-center gap-2 px-3 py-1.5 text-xs border-b ${
               isDark
                 ? 'text-slate-500 border-slate-800 bg-slate-900/40'
-                : 'text-slate-400 border-[#dde5f5] bg-[#f0f4ff]/40'
+                : 'text-slate-400 border-[var(--lumin-border)] bg-[var(--lumin-background)]/40'
             }`}>
               <div className={`w-3 h-3 border border-t-indigo-400 rounded-full animate-spin ${
                 isDark ? 'border-slate-600' : 'border-slate-300'
@@ -460,19 +654,19 @@ export default function App() {
               graph={graph}
               onNodeClick={handleNodeClick}
               selectedNodeId={selectedNode?.id ?? null}
+              active={!activeSource && (sidebarOpen || fullscreen)}
               maximized={maximized}
               onMaximize={() => setMaximized((v) => !v)}
               fullscreen={fullscreen}
               onFullscreen={() => setFullscreen((v) => !v)}
-              editMode={editMode}
+              editMode={editMode && isReady}
               onEditModeChange={setEditMode}
               onAddNode={handleAddNode}
               onDeleteNode={handleDeleteNode}
               onConnectNodes={handleConnectNodes}
               onViewDetails={(id) => {
-                const node = graph.nodes.find((n) => n.id === id)
-                if (node) {
-                  setSelectedNode(node)
+                if (graph.nodes.some((n) => n.id === id)) {
+                  setSelectedNodeId(id)
                   setTimeout(() => nodeDetailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
                 }
               }}
@@ -481,13 +675,13 @@ export default function App() {
           {selectedNode && (
             <div ref={nodeDetailRef}>
             <NodeDetailPanel
+              key={selectedNode.id}
               node={selectedNode}
               edges={graph.edges}
               allNodes={graph.nodes}
               evidence={selectedNodeEvidence}
               evidenceLoading={selectedNodeLoading}
-              apiBase={API_BASE}
-              onClose={() => setSelectedNode(null)}
+              onClose={() => setSelectedNodeId(null)}
               editMode={editMode}
               onDeleteNode={handleDeleteNode}
               onDeleteEdge={handleDeleteEdge}
@@ -499,14 +693,13 @@ export default function App() {
       </aside>
 
       {/* Main — Chat */}
-      <main className="flex flex-col flex-1 min-w-0">
+      <main className="lumin-main flex flex-col flex-1 min-w-0">
         {/* Header */}
-        <header className={`flex items-center gap-3 px-4 py-3 border-b backdrop-blur shrink-0 ${
+        <header className={`lumin-header flex flex-wrap sm:flex-nowrap items-center gap-3 px-4 py-3 border-b backdrop-blur shrink-0 ${
           isDark
             ? 'border-slate-800 bg-slate-900/60'
-            : 'border-[#dde5f5] bg-white/80'
+            : 'border-[var(--lumin-border)] bg-white/80'
         }`}>
-          {view === 'chat' && (
             <button
               onClick={() => setSidebarOpen((v) => !v)}
               className={`transition-colors p-1 rounded ${
@@ -519,67 +712,29 @@ export default function App() {
                 <path d="M14 3h7M14 12h7M14 21h7" strokeLinecap="round" />
               </svg>
             </button>
-          )}
 
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold">
-              L
-            </div>
+            <BrandMark size="small" />
             <div>
-              <span className={`font-semibold text-sm ${isDark ? 'text-white' : 'text-slate-900'}`}>LuminRAG</span>
-              <span className={`text-xs ml-2 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Educational QA</span>
+              <span className={`lumin-brand-name font-semibold text-sm ${isDark ? 'text-white' : 'text-slate-900'}`}>LuminRAG</span>
+              <span className={`lumin-brand-caption ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>A little space to learn</span>
             </div>
           </div>
-
-          <nav className={`ml-4 flex items-center gap-1 rounded-lg border p-0.5 ${
-            isDark ? 'border-slate-700 bg-slate-800/40' : 'border-slate-300 bg-white'
-          }`}>
-            <button
-              onClick={() => setView('chat')}
-              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
-                view === 'chat'
-                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
-                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
-              }`}
-            >
-              Chat
-            </button>
-            <button
-              onClick={() => setView('paper')}
-              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
-                view === 'paper'
-                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
-                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
-              }`}
-            >
-              Paper
-            </button>
-            <button
-              onClick={() => setView('quiz')}
-              className={`text-xs px-2.5 py-1 rounded-md transition-colors ${
-                view === 'quiz'
-                  ? (isDark ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white')
-                  : (isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-800')
-              }`}
-            >
-              Quiz
-            </button>
-          </nav>
 
           <div className="ml-auto flex items-center gap-2">
             {ingestJob && (
               <span className={`text-xs flex items-center gap-1.5 ${
-                ingestJob.stage.startsWith('Failed')
+                ingestJob.failed
                   ? (isDark ? 'text-red-400' : 'text-red-500')
                   : (isDark ? 'text-indigo-400' : 'text-indigo-600')
               }`}>
-                {!ingestJob.stage.startsWith('Failed') && (
+                {!ingestJob.failed && (
                   <div className={`w-3 h-3 border border-t-indigo-400 rounded-full animate-spin ${isDark ? 'border-slate-600' : 'border-slate-300'}`} />
                 )}
                 {ingestJob.stage}
               </span>
             )}
-            {view === 'chat' && !ingestJob && (
+            {!ingestJob && (
               <span className={`text-xs ${isDark ? 'text-slate-600' : 'text-slate-400'}`}>
                 {graph.nodes.filter((n) => n.highlighted).length > 0
                   ? `${graph.nodes.filter((n) => n.highlighted).length} nodes highlighted`
@@ -611,10 +766,23 @@ export default function App() {
               )}
             </button>
 
-            {view === 'chat' && (<>
+            {tokenRequired && isReady && (
+              <button
+                onClick={handleDisconnect}
+                className={`text-xs border px-2.5 py-1 rounded-lg transition-colors ${
+                  isDark
+                    ? 'text-slate-500 hover:text-slate-300 border-slate-700 hover:border-slate-600'
+                    : 'text-slate-500 hover:text-slate-700 border-slate-300 hover:border-slate-400 bg-white hover:bg-slate-50'
+                }`}
+                title="End this session"
+              >
+                Disconnect
+              </button>
+            )}
+
             <button
-              onClick={handleClearData}
-              disabled={clearing}
+              onClick={() => setClearDataOpen(true)}
+              disabled={clearing || !isReady}
               className={`text-xs border px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed ${
                 isDark
                   ? 'text-red-500 hover:text-red-300 border-red-900 hover:border-red-700'
@@ -649,7 +817,7 @@ export default function App() {
               Upload
             </button>
             <button
-              onClick={() => { setMessages([]); setGraph(baseGraphRef.current); setSelectedNode(null) }}
+              onClick={clearChat}
               className={`text-xs border px-2.5 py-1 rounded-lg transition-colors ${
                 isDark
                   ? 'text-slate-500 hover:text-slate-300 border-slate-700 hover:border-slate-600'
@@ -658,37 +826,27 @@ export default function App() {
             >
               Clear
             </button>
-            </>)}
           </div>
         </header>
 
-        {view === 'paper' ? (
-          <PaperView />
-        ) : view === 'quiz' ? (
-          <QuizPanel isDark={isDark} />
-        ) : (
-        <>
+        <WorkspaceToolbar disabled={!canConnect || workspaceLoading || clearing} onSettings={() => setSettingsOpen(true)} />
+        {storageError && <div role="alert" className="text-xs text-red-500 px-4 py-2 border-b border-red-500/20">{storageError}<button onClick={() => setStorageError(null)} className="ml-3">Dismiss</button></div>}
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">
+        <div className="lumin-chat-feed flex-1 overflow-y-auto px-4 py-6 space-y-6">
           {messages.length === 0 && (
-            <div className="flex flex-col items-center justify-center h-full text-center gap-4">
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-3xl font-bold shadow-lg">
-                L
-              </div>
-              <div>
-                <h1 className={`text-xl font-semibold mb-1 ${isDark ? 'text-white' : 'text-slate-900'}`}>LuminRAG</h1>
-                <p className={`text-sm max-w-sm ${isDark ? 'text-slate-500' : 'text-slate-500'}`}>
-                  Ask a question about your course material. The system will retrieve relevant knowledge,
-                  trace its reasoning through the concept graph, and verify its answer.
-                </p>
-              </div>
+            <div className="lumin-welcome">
+              <div className="lumin-welcome-art" aria-hidden="true"><span className="lumin-welcome-spark">✿</span><span className="lumin-welcome-spark">✦</span><BrandMark size="large" /></div>
+              <div><p className="lumin-eyebrow">A little curiosity goes a long way</p><h1>Welcome to your study nook</h1></div>
+              <p className="lumin-welcome-copy">Bring your course material, ask a question, and watch the ideas connect. One small discovery at a time.</p>
+              <button className="lumin-welcome-action" disabled={!isReady} onClick={() => setUploadOpen(true)}>Add your first materials</button>
+              <div className="lumin-welcome-tags"><span>Notes &amp; books</span><span>Connected ideas</span><span>Your own pace</span></div>
               {suggestions.length > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-lg mt-2">
                   {suggestions.slice(0, 4).map((q) => (
                     <button
                       key={q}
                       onClick={() => handleQuery(q)}
-                      className={`text-left text-xs border rounded-xl p-3 transition-all ${
+                      className={`lumin-suggestion text-left text-xs border rounded-xl p-3 transition-all ${
                         isDark
                           ? 'text-slate-400 border-slate-700 hover:border-indigo-600 hover:text-slate-200 bg-slate-800/50 hover:bg-slate-800'
                           : 'text-slate-600 border-slate-200 hover:border-indigo-300 hover:text-slate-800 bg-white hover:bg-indigo-50/50 shadow-sm'
@@ -708,9 +866,7 @@ export default function App() {
 
           {loading && (
             <div className="flex items-start gap-3">
-              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold shrink-0">
-                L
-              </div>
+              <BrandMark size="small" />
               <div className={`rounded-2xl rounded-tl-sm border px-4 py-3 ${
                 isDark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200 shadow-sm'
               }`}>
@@ -727,31 +883,40 @@ export default function App() {
         </div>
 
         {/* Input */}
-        <div className={`px-4 pb-4 pt-2 border-t backdrop-blur shrink-0 ${
-          isDark ? 'border-slate-800 bg-slate-900/60' : 'border-[#dde5f5] bg-white/80'
+        <div className={`lumin-composer-dock px-4 pb-4 pt-2 border-t backdrop-blur shrink-0 ${
+          isDark ? 'border-slate-800 bg-slate-900/60' : 'border-[var(--lumin-border)] bg-white/80'
         }`}>
           <div className="max-w-3xl mx-auto">
-            <QueryInput onSubmit={handleQuery} loading={loading} onFirstKeystroke={handleFirstKeystroke} suggestions={suggestions} />
+            <QueryInput onSubmit={handleQuery} options={querySettings} onOptionsChange={setQuerySettings} loading={loading || !isReady || clearing} onFirstKeystroke={handleFirstKeystroke} suggestions={suggestions} />
           </div>
         </div>
-        </>
-        )}
       </main>
 
       {uploadOpen && (
         <UploadModal
-          onClose={() => setUploadOpen(false)}
+          onClose={closeUpload}
           onJobStarted={handleJobStarted}
         />
       )}
 
+      {(authPhase === 'locked' || authPhase === 'error') && (
+        <AccessGate
+          isDark={isDark}
+          statusError={authPhase === 'error' ? authError : null}
+          onRetryStatus={retryConnect}
+          onAuthenticated={() => setAuthPhase('ready')}
+        />
+      )}
+
+      {(settingsOpen || hosted && !providerReady && authPhase === 'ready') && <SettingsModal hosted={hosted} required={hosted && !providerReady} onClose={() => { setSettingsOpen(false); setProviderReady(!!getLlmSettings().key) }} />}
+      {activeSource && <Suspense fallback={<div role="status" className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60 text-white">Opening source…</div>}><SourceViewer key={activeSource.id} chunk={activeSource} onClose={() => setActiveSource(null)} /></Suspense>}
+      {clearDataOpen && <div className="fixed inset-0 z-[80] bg-black/60 flex items-center justify-center p-4"><div role="alertdialog" aria-modal="true" aria-labelledby="clear-data-title" className={`max-w-sm w-full p-5 rounded-2xl border space-y-3 ${isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}><h2 id="clear-data-title" className="font-semibold">Clear this knowledge base?</h2><p className="text-sm text-slate-500">This removes its materials, graph, original files and chats from this browser and its server cache. Export a .lumin backup first if you want to keep them.</p><div className="flex justify-end gap-3 text-sm"><button onClick={() => setClearDataOpen(false)}>Cancel</button><button onClick={handleClearData} className="text-red-500">Clear knowledge base</button></div></div></div>}
+
       {wakingUp && (
         <div className={`fixed inset-0 z-50 flex flex-col items-center justify-center backdrop-blur gap-4 ${
-          isDark ? 'bg-slate-950/90' : 'bg-[#f0f4ff]/90'
+          isDark ? 'bg-slate-950/90' : 'bg-[var(--lumin-background)]/90'
         }`}>
-          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-2xl font-bold shadow-lg">
-            L
-          </div>
+          <BrandMark size="medium" />
           <div className={`flex items-center gap-2 text-sm font-medium ${isDark ? 'text-slate-300' : 'text-slate-600'}`}>
             <div className={`w-4 h-4 border-2 border-t-indigo-400 rounded-full animate-spin ${
               isDark ? 'border-slate-600' : 'border-slate-300'

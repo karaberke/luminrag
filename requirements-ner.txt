@@ -1,0 +1,4 @@
+# Optional entity extractor; never imported by the hosted graph pipeline.
+gliner==0.2.29
+spacy==3.8.16
+setuptools==84.1.0

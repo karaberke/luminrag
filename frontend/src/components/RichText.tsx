@@ -1,9 +1,10 @@
 import ReactMarkdown from 'react-markdown'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { useTheme } from '../ThemeContext'
+import { useTheme } from '../theme'
+import { trustedMarkdownImageUrl } from '../utils/source'
 
-interface RichTextProps {
+export interface RichTextProps {
   text: string
   className?: string
   onCitationClick?: (n: number) => void
@@ -50,6 +51,10 @@ export function RichText({ text, className, onCitationClick }: RichTextProps) {
         remarkPlugins={[remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
         components={{
+          img: ({ src, alt }) => {
+            const trusted = trustedMarkdownImageUrl(typeof src === 'string' ? src : undefined)
+            return trusted ? <img src={trusted} alt={alt ?? ''} loading="lazy" /> : <span>{alt ?? ''}</span>
+          },
           a: ({ href, children, ...props }) => {
             const citMatch = href?.match(/^#citation-(\d+)$/)
             if (citMatch && onCitationClick) {

@@ -1,0 +1,35 @@
+FROM python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LUMIN_HOSTED=1 \
+    PORT=8000 \
+    FASTEMBED_CACHE_PATH=/opt/models \
+    HF_HOME=/opt/models/huggingface \
+    XDG_CACHE_HOME=/tmp/lumin-cache \
+    HOME=/home/lumin
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 lumin
+
+WORKDIR /app
+COPY requirements-hosted.lock requirements-bootstrap.lock ./
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements-bootstrap.lock \
+    && pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements-hosted.lock
+ENV ORT_DISABLE_TELEMETRY=1
+COPY backend/utils/models.py backend/utils/model_manifest.json backend/utils/
+COPY scripts/cache_models.py scripts/cache_models.py
+RUN python scripts/cache_models.py
+ENV HF_HUB_OFFLINE=1 LUMIN_MODEL_THREADS=2
+COPY backend/ backend/
+COPY config/ config/
+RUN chown -R root:root /app /opt/models /home/lumin \
+    && chmod -R a-w /app /opt/models /home/lumin \
+    && chmod -R a+rX /app /opt/models /home/lumin
+
+USER lumin
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:'+__import__('os').environ.get('PORT','8000')+'/api/ready', timeout=4).close()"
+CMD ["python", "-m", "backend"]

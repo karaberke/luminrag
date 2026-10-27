@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest an improvement for learning with LuminRAG.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Explain the learning task or workflow that could be better.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: Describe the behavior you would like and any alternatives you considered.
+    validations:
+      required: true

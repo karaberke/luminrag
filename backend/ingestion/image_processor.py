@@ -25,10 +25,12 @@ from pathlib import Path
 
 from backend.ingestion.captioners import build_captioner, safe_caption
 from backend.schemas import Chunk
+from backend.utils.ingestion_limits import check_image_dimensions
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_SUPPORTED_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
+_SUPPORTED_EXTENSIONS = frozenset(_SUPPORTED_FORMATS)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +41,11 @@ def _get_dimensions(image_path: Path) -> tuple[int, int]:
     """Return (width, height) for the image using Pillow."""
     from PIL import Image
 
-    with Image.open(image_path) as img:
+    # Restrict decoder discovery as well as filenames. Renaming an FPX, EPS,
+    # JPEG 2000 or other unsupported format must never activate its parser.
+    with Image.open(image_path, formats=[_SUPPORTED_FORMATS[image_path.suffix.lower()]]) as img:
+        check_image_dimensions(img.width, img.height)
+        img.verify()
         return img.width, img.height
 
 

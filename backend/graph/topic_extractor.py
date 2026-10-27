@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel, Field
+
 from backend.graph._llm import resolve_synonym, safe_call_json
 from backend.graph.schema import TopicProposal
 
@@ -24,6 +26,15 @@ if TYPE_CHECKING:
     from backend.retrieval.embedder import Embedder
 
 logger = logging.getLogger(__name__)
+
+
+class _TopicPayload(TopicProposal):
+    name: str = Field(min_length=1)
+    summary: str
+
+
+class _TopicItems(BaseModel):
+    items: list[_TopicPayload]
 
 
 _PROMPT = """\
@@ -99,7 +110,7 @@ def extract_topics(
     max_topics = int(cfg.get("max_topics", _max_topics_for_length(len(preview))))
     prompt = _PROMPT.format(preview=preview, max_topics=max_topics)
 
-    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 512))
+    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 512), response_model=_TopicItems)
     proposals: list[TopicProposal] = []
     for entry in raw[:max_topics]:
         try:

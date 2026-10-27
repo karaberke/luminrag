@@ -1,18 +1,10 @@
-import { createContext, useContext, useState } from 'react'
-
-export type Theme = 'dark' | 'light'
-
-interface ThemeCtx {
-  theme: Theme
-  toggleTheme: () => void
-}
-
-const ThemeContext = createContext<ThemeCtx>({ theme: 'dark', toggleTheme: () => {} })
+import { useLayoutEffect, useState } from 'react'
+import { ThemeContext, type Theme } from './theme'
+import { initialTheme } from './utils/appearance'
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    return (localStorage.getItem('lumin-theme') as Theme) ?? 'dark'
-  })
+  const [theme, setTheme] = useState<Theme>(initialTheme)
+  useLayoutEffect(() => { document.documentElement.dataset.theme = theme }, [theme])
 
   const toggleTheme = () => {
     setTheme((t) => {
@@ -24,5 +16,3 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   return <ThemeContext.Provider value={{ theme, toggleTheme }}>{children}</ThemeContext.Provider>
 }
-
-export const useTheme = () => useContext(ThemeContext)

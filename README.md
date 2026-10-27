@@ -1,247 +1,113 @@
-# LuminRAG
-
-**Adaptive Self-Verifying Graph-Augmented QA for Education**
-
-LuminRAG is a research prototype for question answering over multimodal university course content. It combines dense vector retrieval, graph-based multi-hop reasoning (GraphRAG), and Self-RAG-style self-reflection into a single adaptive pipeline — and surfaces the full reasoning trace through an interactive concept knowledge graph in the browser.
-
-The system ingests lecture videos, slide decks, PDFs, audio recordings, and images; constructs a concept knowledge graph from the extracted entities and relations; and answers natural-language questions by routing each query through whichever retrieval strategy is most appropriate. Every answer is accompanied by source evidence, a routing label, and a four-axis Self-RAG verdict.
-
+---
+title: LuminRAG
+emoji: 🌿
+colorFrom: yellow
+colorTo: green
+sdk: docker
+app_port: 8000
+license: agpl-3.0
 ---
 
-## Research hypothesis
+<p align="center">
+  <img src="frontend/public/brand.svg" alt="LuminRAG — a book growing into a knowledge graph" width="88" height="88" />
+</p>
 
-Does augmenting a traditional dense RAG pipeline with a self-verifying, graph-based multi-hop retrieval system significantly improve factual grounding and answer accuracy on complex, university-level educational queries?
+<h1 align="center">LuminRAG</h1>
 
-### Baselines
+<p align="center"><strong>Turn your learning material into answers you can trace.</strong></p>
+<p align="center">Source-grounded questions. An editable concept graph. Your own AI provider.</p>
 
-| System | Description |
-|--------|-------------|
-| Naive RAG | Vector DB + dense embeddings + LLM generation |
-| Pure GraphRAG | Graph-based multi-hop retrieval only (no Self-RAG gate) |
-| Pure Self-RAG | Vector retrieval + reflection gate (no knowledge graph) |
-| **LuminRAG (Full)** | Multimodal ingestion + adaptive routing + graph/vector retrieval + Self-RAG verification |
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-66834d" alt="License: AGPL-3.0" /></a>
+  <a href="docs/getting-started.md"><img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12 or newer" /></a>
+  <a href="frontend/package.json"><img src="https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white" alt="React 19" /></a>
+  <a href="docs/usage.md"><img src="https://img.shields.io/badge/storage-in_your_browser-66834d" alt="Knowledge bases stored in your browser" /></a>
+</p>
 
-### Benchmark datasets
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="docs/usage.md">User guide</a> ·
+  <a href="docs/deployment.md">Deploy</a> ·
+  <a href="code_logic.md">Architecture</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
 
-- **HotpotQA** — multi-hop QA gold standard
-- **MuSiQue** — rigorous multi-hop, resistant to single-hop shortcuts
-- **ScienceQA** — multimodal science questions (text + images)
-- **QASper** — QA over NLP research papers
-- **Lumin-Edu (custom)** — questions from actual university lecture videos, slides, and PDFs
+LuminRAG is an educational question-answering app that connects your documents through a **Topic → Subtopic → Content** knowledge graph. Ask a question, inspect the supporting passages, and explore the concepts used to answer it. Dense retrieval, graph retrieval and Self-RAG verification make the evidence visible as you learn.
 
-### Metrics
+## What you can do
 
-- **Hit Rate @ K** and **MRR** — retrieval quality
-- **Faithfulness** (hallucination rate) — maps to Self-RAG `is_supported`
-- **Answer Relevance** — maps to `is_useful`
-- **Context Precision** — relevance of retrieved context
+| Capability | How it helps |
+| --- | --- |
+| **Ask with evidence** | Open numbered citations at the supporting PDF page, slide or extracted passage. |
+| **Explore connected concepts** | Follow highlighted graph paths and inspect source-backed connections. |
+| **Build your own notes** | Edit concepts, add Markdown and LaTeX notes, create `[[wikilinks]]`, merge duplicates, and undo changes. |
+| **Choose your retrieval** | Use dense, graph or hybrid retrieval; choose Fast or Thorough reasoning. |
+| **Bring your material** | Import PDFs, images, Office files, HTML, EPUB, Markdown and text. Self-hosted audio/video is optional. |
+| **Keep portable knowledge bases** | Store files, graphs and chats in your browser; export `.lumin` backups to move between devices. |
+| **Choose your AI provider** | Connect OpenRouter or Anthropic with your own key. Self-hosting also supports Ollama. |
 
----
+## How it works
 
-## Architecture
-
+```mermaid
+flowchart LR
+    A[Your learning material] --> B[Parse and preserve sources]
+    B --> C[Passage embeddings]
+    B --> D[Topic → Subtopic → Content graph]
+    Q[Your question] --> E[Dense / graph / hybrid retrieval]
+    C --> E
+    D --> E
+    E --> F[Answer with source citations]
+    E --> G[Thorough mode: Self-RAG checks]
+    G --> F
+    F --> H[Read the evidence and explore the graph]
 ```
-Multimodal Sources → [Ingestion] → [Document Store + Vector Index + Concept Graph]
-                                                    ↓
-              Query → [Multi-hop Decomposer] → per sub-question:
-                                                    ├─ Query Router  →  "dense" | "graph" | "hybrid" | "none"
-                                                    ├─ Dense Retrieval (FAISS)
-                                                    │   and/or Graph Retrieval (BFS over concept graph)
-                                                    └─ Self-RAG gate (reflect_retrieval)
-                                                    ↓
-                                          [Cross-encoder Reranker]  ← min_relevancy / max_sources
-                                                    ↓
-                                              [Generator + reflect_answer]
-                                                    ↓
-                                         Answer + Citations + Graph Hop Trace
-```
 
-### Storage
+The frontend uses React, TypeScript, Sigma and IndexedDB. The Python service uses FastAPI, FastEmbed, NumPy and NetworkX. See the [architecture](code_logic.md) and [API reference](docs/reference.md) for details.
 
-| Store | Engine | Purpose |
-|-------|--------|---------|
-| Document store | SQLite | Raw text chunks and source metadata |
-| Vector index | FAISS `IndexFlatIP` | Dense retrieval; L2-normalised embeddings ≡ cosine similarity |
-| Concept graph | NetworkX + JSON | Multi-hop traversal and browser mindmap rendering |
+## Quick start
 
----
+Requires **Python 3.12+**, **Node.js 22+** and **pnpm 10**. Run from the repository root in PowerShell:
 
-## Quick start — Docker
-
-**Requirements:** Docker, an [Anthropic API key](https://console.anthropic.com).
-
-```bash
-git clone <repo>
+```powershell
+git clone https://github.com/karaberke/luminrag.git
 cd luminrag
-
-cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY=sk-ant-...
-
-docker compose up --build
-```
-
-| Service | URL |
-|---------|-----|
-| Frontend | http://localhost |
-| Backend API | http://localhost:8000 |
-| Swagger docs | http://localhost:8000/docs |
-
-Ingested data (SQLite DB, FAISS index, concept graph) is persisted in a named Docker volume and survives restarts. `config/` is bind-mounted so LLM settings can be changed without rebuilding.
-
----
-
-## Local development
-
-**Requirements:** Python 3.11+, Node.js 20+, pnpm, ffmpeg.
-
-```bash
-# Python environment
 python -m venv .venv
-source .venv/Scripts/activate     # Windows bash
-# source .venv/bin/activate       # macOS / Linux
-
-pip install -r requirements.txt
-cp .env.example .env              # then fill in ANTHROPIC_API_KEY
-
-# Backend — http://localhost:8000
-python -m backend
-
-# Frontend — http://localhost:5173 (separate terminal)
-cd frontend
-pnpm install
-pnpm dev
+.venv/Scripts/python.exe -m pip --isolated install --index-url https://pypi.org/simple --require-hashes --only-binary=:all: -r requirements-bootstrap.lock
+.venv/Scripts/python.exe -m pip --isolated install --index-url https://pypi.org/simple --require-hashes --only-binary=:all: -r requirements-hosted.lock
+.venv/Scripts/python.exe -m pip check
+pnpm --dir frontend install --frozen-lockfile
+.\scripts\run_local.ps1
 ```
 
-The Vite dev server proxies `/api/*` to `localhost:8000`, so both servers can run side-by-side without CORS configuration.
+Open **http://127.0.0.1:5173**, connect a provider in **AI settings**, and upload your first document. Initial startup downloads and verifies the pinned retrieval models. Your provider charges apply when you process material or ask questions.
 
-### Running tests
+The launcher starts both services in temporary-workspace mode. Use `-SelfHosted` for persistent local storage. For separate terminals, macOS/Linux setup, optional audio/video, or Docker, see [getting started](docs/getting-started.md).
 
-```bash
-pytest                            # all 358 tests
-pytest backend/tests/test_generator.py          # single file
-pytest backend/tests/test_generator.py::test_fn # single test
-```
+## Your data and keys
 
----
+- **Browser storage:** Knowledge bases, original files and chats live in IndexedDB. Export backups before clearing browser data.
+- **Temporary hosted compute:** The service parses material, builds embeddings and runs retrieval in isolated temporary workspaces. It can restore compute state from your browser when its cache expires.
+- **Your provider:** Prompts and relevant source context go to the AI provider you select. Use HTTPS for remote deployments.
+- **Key handling:** Keys remain in browser memory unless you choose to remember them on the device. They are sent when provider work is needed and are excluded from workspace backups.
+- **Local files:** Actual `.env` files, credential files, local datasets and agent instructions are excluded from Git. The committed `.env.example` templates contain no keys.
 
-## Ingesting course content
+Read the [security policy](SECURITY.md) and [deployment guide](docs/deployment.md) before exposing a service publicly.
 
-**Via the UI:** click **Upload** in the top-right corner to add files through the browser. The backend ingests them and rebuilds the vector index and concept graph live.
+## Documentation
 
-**Via CLI (batch ingestion):**
+| I want to… | Start here |
+| --- | --- |
+| Run locally or with Docker | [Getting started](docs/getting-started.md) |
+| Upload, ask questions, edit graphs or restore a backup | [User guide](docs/usage.md) |
+| Deploy the frontend and Python service | [Deployment guide](docs/deployment.md) |
+| Configure limits or call the API | [Configuration and API](docs/reference.md) |
+| Understand the data and reasoning pipeline | [Architecture](code_logic.md) |
+| Run checks or contribute a change | [Contributing](CONTRIBUTING.md) |
 
-```bash
-# Place raw files in backend/data/raw/, then run:
-python scripts/ingest.py
+## Current boundaries
 
-# Preview what would run without executing
-python scripts/ingest.py --dry-run
+Standard PDF ingestion requires selectable text; scanned pages need the visual slide option with a vision-capable provider or external OCR. Hosted audio/video is not supported. Word previews can paginate differently from Microsoft Word. Browser storage can be cleared or evicted, so keep exported backups. Application login and optional Drive sync are future work.
 
-# Mark specific PDFs as slide decks (captioned per page instead of text-chunked)
-python scripts/ingest.py --slides lecture_slides.pdf week2.pdf
+## License
 
-# Point at a different folder
-python scripts/ingest.py path/to/folder
-```
-
-Supported formats: `.pdf`, `.mp4/.mkv/.mov/.avi`, `.mp3/.wav/.m4a/.ogg/.flac/.aac/.wma`, `.jpg/.jpeg/.png/.webp`.
-
----
-
-## Pipeline stages
-
-### Stage 1 — Multimodal ingestion
-
-| Module | Description |
-|--------|-------------|
-| `video_transcriber.py` | Whisper transcription + OpenCV SSIM keyframe extraction + LLM captioning; chunks by timestamp interval |
-| `slide_processor.py` | One chunk per PDF slide page, captioned via LLM |
-| `pdf_processor.py` | Semantic chunking of textbook/notes by font-size heading boundaries |
-| `audio_processor.py` | Whisper transcription of standalone audio files |
-| `image_processor.py` | Single-image captioning via Ollama or Anthropic |
-
-### Stage 2 — Concept graph construction
-
-Two-step extraction: fast local NER (GLiNER or spaCy) identifies entities; a lightweight LLM call maps relations between them. Valid relation types: `PART_OF`, `PREREQUISITE`, `CAUSES`, `EXAMPLE_OF`, `EXPLAINS`, `BELONGS_TO_TOPIC`.
-
-### Stage 3 — Query routing
-
-Routes each (sub-)question to the appropriate retrieval strategy using heuristics with an optional LLM fallback. "What is X?" / "Define Y" → `dense`; "Why does…" / "Compare A and B" → `graph`; general knowledge → `none`.
-
-### Stage 4 — Retrieval
-
-**Dense path** (`vector_retriever.py`): query embedding → top-K FAISS lookup → ranked chunks.
-
-**Graph path** (`graph_retriever.py`): embed query → cosine-match anchor nodes → relevance-guided BFS (expand neighbour only if cosine similarity ≥ threshold) → collect subgraph triples + source chunks.
-
-**Hybrid path**: runs both dense and graph retrieval, then deduplicates by chunk ID before reranking.
-
-### Stage 4.5 — Cross-encoder reranking
-
-`reranker.py` re-scores all retrieved chunks with `cross-encoder/ms-marco-MiniLM-L-6-v2` (a cross-encoder that takes the full query–passage pair). Raw logits are mapped to (0, 1) via sigmoid. Two per-request knobs:
-- `min_relevancy` — drop chunks below this threshold (meaningful range 0.3–0.7)
-- `max_sources` — cap the number of chunks sent to the generator
-
-### Stage 5 — Self-RAG reflection
-
-Two gates:
-- `reflect_retrieval()` — pre-generation; checks `is_relevant` and skips irrelevant context.
-- `reflect_answer()` — post-generation; checks all four verdicts. Both gates default to safe pass-through on LLM failure.
-
-### Stage 6 — Multi-hop reasoning
-
-Decomposes complex questions into ≤4 sub-questions, runs retrieval + reflection per sub-question, then merges all evidence into a single `RetrievalResult` for the generator.
-
-### Stage 7 — Generation
-
-Selects a prompt template (`DENSE_RAG_PROMPT`, `GRAPH_RAG_PROMPT`, or `NO_RETRIEVAL_PROMPT`) based on routing mode, calls the configured LLM, and returns the answer with inline `[N]` citations.
-
----
-
-## Using Ollama instead of Anthropic
-
-All LLM-calling stages support local [Ollama](https://ollama.com) as an alternative provider. Switch any section in `config/llm.yaml` from `provider: anthropic` to `provider: ollama` and set the corresponding model. The config is bind-mounted in Docker — no rebuild needed.
-
-```yaml
-# config/llm.yaml — example: switch the generator to a local model
-generator:
-  provider: ollama
-  ollama_model: llama3.2:3b
-  ollama_base_url: http://host.docker.internal:11434  # inside Docker
-  # ollama_base_url: http://localhost:11434           # local dev
-```
-
----
-
-## Configuration reference
-
-| File | Purpose |
-|------|---------|
-| `config/llm.yaml` | Provider/model for every pipeline stage; Whisper settings; chunking parameters; retrieval thresholds |
-| `config/db.yaml` | Paths for SQLite store, FAISS index, and graph JSON |
-| `.env` | `ANTHROPIC_API_KEY`; optional `HF_TOKEN` for private HuggingFace models |
-
----
-
-## API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/health` | Liveness — reports index/graph/chunk-count status |
-| `GET` | `/api/graph` | Full concept graph as `{nodes, edges}` |
-| `POST` | `/api/query` | Run the QA pipeline; body: `{"query": "...", "routing_mode": "dense"\|"graph"\|"hybrid"\|null, "min_relevancy": 0.0, "max_sources": null}` |
-| `POST` | `/api/ingest` | Upload files (multipart); returns `202` with `job_id` immediately |
-| `POST` | `/api/ingest/from-s3` | Ingest files already uploaded to S3; returns `202` with `job_id` |
-| `GET` | `/api/ingest/jobs/{job_id}` | Poll async ingest job status |
-| `POST` | `/api/upload/presign` | Get pre-signed S3 URLs for direct browser upload |
-| `GET` | `/api/suggestions` | Dynamic query suggestions based on graph content |
-| `GET` | `/api/source/{source_id}` | Fetch raw source metadata for a chunk |
-| `GET` | `/api/graph/node/{node_id}` | Node detail + evidence chunks |
-| `POST` | `/api/graph/node` | Add a graph node manually |
-| `PATCH` | `/api/graph/node/{node_id}` | Edit node attributes |
-| `DELETE` | `/api/graph/node/{node_id}` | Remove a node |
-| `POST` | `/api/graph/edge` | Add an edge manually |
-| `DELETE` | `/api/graph/edge` | Remove an edge |
-| `DELETE` | `/api/data` | Wipe all stored data and reset in-memory state |
-
-Interactive docs at `/docs` when the backend is running.
+Created and maintained by [Berke Kara](https://github.com/karaberke). Licensed under [AGPL-3.0](LICENSE). Operators of modified network-accessible versions must provide the corresponding source as required by the license.

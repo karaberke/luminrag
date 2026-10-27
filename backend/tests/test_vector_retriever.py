@@ -1,7 +1,7 @@
 """
 Tests for backend/retrieval/vector_retriever.py
 
-Uses real embeddings + FAISS (no mocking). The embedder fixture is
+Uses real FastEmbed embeddings + NumPy (no mocking). The embedder fixture is
 module-scoped so the model loads once across all tests.
 """
 
@@ -23,7 +23,7 @@ from backend.schemas import Chunk, RetrievalResult
 
 @pytest.fixture(scope="module")
 def embedder() -> Embedder:
-    return Embedder("all-MiniLM-L6-v2")
+    return Embedder("BAAI/bge-small-en-v1.5")
 
 
 def _chunk(id: str, text: str, source_id: str = "src", modality: str = "pdf") -> Chunk:
@@ -58,11 +58,6 @@ def store(tmp_path: Path) -> DocumentStore:
 # ---------------------------------------------------------------------------
 
 class TestBuild:
-    def test_len_after_build(self, embedder):
-        idx = VectorIndex(embedder)
-        idx.build(CORPUS)
-        assert len(idx) == len(CORPUS)
-
     def test_build_empty_raises(self, embedder):
         idx = VectorIndex(embedder)
         with pytest.raises(ValueError):
@@ -74,15 +69,14 @@ class TestBuild:
 # ---------------------------------------------------------------------------
 
 class TestSearch:
-    def test_returns_correct_count(self, built_index):
-        results = built_index.search("enzyme kinetics", top_k=3)
+    def test_ranked_search_returns_typed_scores_with_requested_limit(self, built_index):
+        results = built_index.search("enzyme", top_k=3)
         assert len(results) == 3
-
-    def test_returns_tuples_of_str_and_float(self, built_index):
-        results = built_index.search("enzyme", top_k=2)
         for chunk_id, score in results:
             assert isinstance(chunk_id, str)
             assert isinstance(score, float)
+        scores = [score for _, score in results]
+        assert scores == sorted(scores, reverse=True)
 
     def test_top_result_is_semantically_closest(self, built_index):
         results = built_index.search("enzyme reaction catalysis", top_k=5)
@@ -93,11 +87,6 @@ class TestSearch:
         results = built_index.search("retrieval augmented generation LLM", top_k=3)
         top_ids = [r[0] for r in results]
         assert "c2" in top_ids or "c3" in top_ids
-
-    def test_scores_sorted_descending(self, built_index):
-        results = built_index.search("enzyme", top_k=5)
-        scores = [s for _, s in results]
-        assert scores == sorted(scores, reverse=True)
 
     def test_top_k_capped_at_corpus_size(self, built_index):
         results = built_index.search("enzyme", top_k=100)
@@ -114,35 +103,18 @@ class TestSearch:
 # ---------------------------------------------------------------------------
 
 class TestPersistence:
-    def test_save_creates_files(self, embedder, tmp_path):
-        idx = VectorIndex(embedder)
-        idx.build(CORPUS)
-        path = tmp_path / "test.index"
-        idx.save(path)
-        assert path.exists()
-        assert path.with_suffix(".json").exists()
-
-    def test_load_restores_len(self, embedder, tmp_path):
+    def test_round_trip_preserves_corpus_size_and_ranked_results(self, embedder, tmp_path):
         idx1 = VectorIndex(embedder)
         idx1.build(CORPUS)
         path = tmp_path / "test.index"
         idx1.save(path)
+        assert path.exists() and path.with_suffix(".json").exists()
 
         idx2 = VectorIndex(embedder)
         idx2.load(path)
-        assert len(idx2) == len(idx1)
-
-    def test_round_trip_returns_same_top_result(self, embedder, tmp_path):
-        idx1 = VectorIndex(embedder)
-        idx1.build(CORPUS)
-        path = tmp_path / "test.index"
-        idx1.save(path)
-
-        idx2 = VectorIndex(embedder)
-        idx2.load(path)
-
+        assert len(idx2) == len(idx1) == len(CORPUS)
         q = "enzyme catalysis reaction"
-        assert idx1.search(q, 1)[0][0] == idx2.search(q, 1)[0][0]
+        assert idx1.search(q, len(CORPUS)) == idx2.search(q, len(CORPUS))
 
     def test_load_missing_file_raises(self, embedder, tmp_path):
         idx = VectorIndex(embedder)
@@ -158,20 +130,11 @@ class TestRetrieveDense:
     def _config(self, top_k: int = 3) -> dict:
         return {"vector_retriever": {"top_k": top_k}}
 
-    def test_returns_retrieval_result(self, built_index, store):
+    def test_retrieval_returns_dense_passages_without_a_graph_trace(self, built_index, store):
         result = retrieve_dense("enzyme", built_index, store, self._config())
         assert isinstance(result, RetrievalResult)
-
-    def test_routing_mode_is_dense(self, built_index, store):
-        result = retrieve_dense("enzyme", built_index, store, self._config())
         assert result.routing_mode == "dense"
-
-    def test_subgraph_is_empty(self, built_index, store):
-        result = retrieve_dense("enzyme", built_index, store, self._config())
         assert result.subgraph == []
-
-    def test_returns_chunk_objects(self, built_index, store):
-        result = retrieve_dense("enzyme", built_index, store, self._config())
         assert all(isinstance(c, Chunk) for c in result.chunks)
 
     def test_chunk_count_respects_top_k(self, built_index, store):

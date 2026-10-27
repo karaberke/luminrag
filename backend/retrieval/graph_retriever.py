@@ -23,6 +23,8 @@ Public API:
 from __future__ import annotations
 
 import logging
+import threading
+from weakref import WeakKeyDictionary
 
 import networkx as nx
 import numpy as np
@@ -31,6 +33,8 @@ from backend.db.document_store import DocumentStore
 from backend.graph.graph_builder import GraphBuilder
 from backend.retrieval.embedder import Embedder
 from backend.schemas import Chunk, GraphTriple, RetrievalResult
+from backend.utils.resources import reserve_model_resource
+from backend.utils.text import node_text as _node_text
 
 logger = logging.getLogger(__name__)
 
@@ -38,54 +42,65 @@ logger = logging.getLogger(__name__)
 # Node embedding cache (populated at startup / after graph mutations)
 # ---------------------------------------------------------------------------
 
-_node_emb_cache: dict[str, np.ndarray] = {}
+# Caches follow each graph object's lifetime. Identical node keys in different
+# workspaces never share embeddings or text. The one lock only gates inference.
+_graph_caches: WeakKeyDictionary = WeakKeyDictionary()
+_node_emb_lock = threading.RLock()
 
-# Edges that act as true leaves — do not expand through them and exclude them
-# from the user-facing subgraph (they point from ChunkRef → Content).
+
+def reserve_node_embeddings():
+    return reserve_model_resource(_node_emb_lock)
+
+
+def clear_node_embeddings(graph: nx.MultiDiGraph | None = None) -> None:
+    with reserve_node_embeddings():
+        if graph is None:
+            _graph_caches.clear()
+        else:
+            _graph_caches.pop(graph, None)
+
+
 _LEAF_RELATIONS = frozenset({"EVIDENCE_OF"})
 
 
 def warm_up(graph: nx.MultiDiGraph, embedder: Embedder) -> None:
-    """
-    Pre-compute L2-normalised embeddings for every Topic/Subtopic/Content
-    node. Chunk-ref nodes are skipped — they are never scored against queries.
-    """
-    global _node_emb_cache
-    if graph.number_of_nodes() == 0:
-        _node_emb_cache = {}
-        return
-    keys: list[str] = []
-    texts: list[str] = []
-    for k, attrs in graph.nodes(data=True):
-        if attrs.get("node_type") == "chunk_ref":
-            continue
-        keys.append(k)
-        texts.append(_node_text(attrs, k))
-    if not keys:
-        _node_emb_cache = {}
-        return
-    embs = embedder.embed(texts)
-    _node_emb_cache = dict(zip(keys, embs))
-    logger.info(f"Node embedding cache: {len(_node_emb_cache)} nodes precomputed")
-
-
-def _node_text(attrs: dict, key: str) -> str:
-    """Text used to embed a node for anchor scoring. Uses summary when available."""
-    name = attrs.get("name", key)
-    ntype = attrs.get("node_type", "")
-    if ntype == "content":
-        summary = attrs.get("summary_intermediate", "") or attrs.get("summary_beginner", "")
-    else:
-        summary = attrs.get("summary", "")
-    return f"{name}. {summary}".strip()
+    with reserve_node_embeddings():
+        keys = [key for key, attrs in graph.nodes(data=True) if attrs.get("node_type") != "chunk_ref"]
+        cache = _graph_caches.get(graph)
+        if cache:
+            current = set(keys)
+            for key in set(cache[1]) - current:
+                cache[1].pop(key, None)
+                cache[2].pop(key, None)
+        if keys:
+            _get_node_embeddings(keys, graph, embedder)
 
 
 def _embed_keys(keys: list[str], graph: nx.MultiDiGraph, embedder: Embedder) -> np.ndarray:
-    """Batch-fetch embeddings from cache or compute fresh if missing."""
-    if _node_emb_cache and all(k in _node_emb_cache for k in keys):
-        return np.stack([_node_emb_cache[k] for k in keys])
-    texts = [_node_text(graph.nodes[k], k) for k in keys]
-    return embedder.embed(texts)
+    return get_node_embeddings(keys, graph, embedder)
+
+
+def get_node_embeddings(keys: list[str], graph: nx.MultiDiGraph, embedder: Embedder) -> np.ndarray:
+    with reserve_node_embeddings():
+        return _get_node_embeddings(keys, graph, embedder)
+
+
+def _get_node_embeddings(keys: list[str], graph: nx.MultiDiGraph, embedder: Embedder) -> np.ndarray:
+    cache = _graph_caches.get(graph)
+    if cache is None or cache[0] is not embedder:
+        cache = (embedder, {}, {})
+        _graph_caches[graph] = cache
+    _, vectors, cached_texts = cache
+    if not keys:
+        return np.empty((0, getattr(embedder, "dimension", 0)), dtype=np.float32)
+    texts = {key: _node_text(graph.nodes[key], key) for key in keys}
+    missing = [key for key in dict.fromkeys(keys) if key not in vectors or cached_texts.get(key) != texts[key]]
+    if missing:
+        embeddings = embedder.embed([texts[key] for key in missing])
+        for key, embedding in zip(missing, embeddings):
+            vectors[key] = embedding
+            cached_texts[key] = texts[key]
+    return np.stack([vectors[key] for key in keys])
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +145,10 @@ def _find_anchors(
     embedder: Embedder,
     top_k: int,
     key_term_boost: float = 0.15,
+    relevance_threshold: float = 0.4,
+    query_emb: np.ndarray | None = None,
 ) -> list[str]:
-    if graph.number_of_nodes() == 0:
+    if graph.number_of_nodes() == 0 or top_k <= 0:
         return []
 
     q_lower = query.lower()
@@ -142,7 +159,7 @@ def _find_anchors(
     if not all_keys:
         return []
 
-    q_emb = embedder.embed_one(query)
+    q_emb = query_emb if query_emb is not None else getattr(embedder, "embed_query", embedder.embed_one)(query)
 
     # --- Topic scoping ---
     topic_keys = [k for k in all_keys if graph.nodes[k].get("node_type") == "topic"]
@@ -152,37 +169,32 @@ def _find_anchors(
         topic_embs = _embed_keys(topic_keys, graph, embedder)
         topic_scores = (topic_embs @ q_emb).tolist()
         ranked = sorted(zip(topic_scores, topic_keys), key=lambda x: x[0], reverse=True)
-        top_topics: set[str] = {ranked[0][1]}
-        if len(ranked) > 1 and ranked[1][0] > 0.25:
-            top_topics.add(ranked[1][1])
+        top_topics = {key for score, key in ranked[:2] if score >= relevance_threshold}
 
         logger.debug(
             f"Top topics for '{query[:50]}': "
             f"{[(graph.nodes[k].get('name', k), round(s, 3)) for s, k in ranked[:3]]}"
         )
 
-        members = _topic_descendants(graph, top_topics)
-        if len(members) > len(top_topics):
-            candidate_pool = [k for k in all_keys if k in members]
+        if top_topics:
+            members = _topic_descendants(graph, top_topics)
+            # Standalone authored notes also remain searchable. Do not pad
+            # a small relevant branch with unrelated disconnected topics,
+            # even when its only member is the topic itself.
+            candidate_pool = [k for k in all_keys if k in members or graph.nodes[k].get("node_type") == "note"]
 
     # --- String matches within candidate pool (name OR key_terms) ---
     string_hits = [
         k for k in candidate_pool
-        if graph.nodes[k].get("name", k).lower() in q_lower
+        if (graph.nodes[k].get("name", k).strip() and graph.nodes[k].get("name", k).lower() in q_lower)
         or _key_term_hit(graph.nodes[k], q_lower)
     ]
     if len(string_hits) >= top_k:
         return string_hits[:top_k]
 
     # --- Embedding fallback (with key_terms boost) ---
-    remaining = [k for k in candidate_pool if k not in set(string_hits)]
-    if (len(remaining) + len(string_hits)) < top_k and candidate_pool is not all_keys:
-        extra = [
-            k for k in all_keys
-            if k not in set(candidate_pool) and k not in set(string_hits)
-        ]
-        remaining = remaining + extra
-
+    string_hit_keys = set(string_hits)
+    remaining = [k for k in candidate_pool if k not in string_hit_keys]
     if not remaining:
         return string_hits
 
@@ -198,7 +210,7 @@ def _find_anchors(
         )
         scores = scores + boosts
     n_needed = top_k - len(string_hits)
-    top_idx = np.argsort(scores)[::-1][:n_needed]
+    top_idx = [i for i in np.argsort(scores)[::-1] if scores[i] >= relevance_threshold][:n_needed]
     return string_hits + [remaining[i] for i in top_idx]
 
 
@@ -218,10 +230,9 @@ def _bfs(
     visited: set[str] = set(anchors)
     frontier: list[str] = list(anchors)
     subgraph_nodes: set[str] = set(anchors)
-    subgraph_edges: list[tuple[str, str, dict]] = []
 
     for hop in range(max_hops):
-        candidate_map: dict[str, list[tuple[str, str, dict]]] = {}
+        candidates: set[str] = set()
 
         for node_key in frontier:
             for _, v, edata in graph.out_edges(node_key, data=True):
@@ -231,7 +242,7 @@ def _bfs(
                     continue
                 if graph.nodes[v].get("node_type") == "chunk_ref":
                     continue
-                candidate_map.setdefault(v, []).append((node_key, v, edata))
+                candidates.add(v)
             for u, _, edata in graph.in_edges(node_key, data=True):
                 if u in visited:
                     continue
@@ -239,12 +250,12 @@ def _bfs(
                     continue
                 if graph.nodes[u].get("node_type") == "chunk_ref":
                     continue
-                candidate_map.setdefault(u, []).append((u, node_key, edata))
+                candidates.add(u)
 
-        if not candidate_map:
+        if not candidates:
             break
 
-        cand_keys = list(candidate_map.keys())
+        cand_keys = sorted(candidates)
         cand_embs = _embed_keys(cand_keys, graph, embedder)
         scores = (cand_embs @ query_emb).tolist()
 
@@ -255,8 +266,6 @@ def _bfs(
                 break
             visited.add(v)
             subgraph_nodes.add(v)
-            for src, tgt, edata in candidate_map[v]:
-                subgraph_edges.append((src, tgt, edata))
             next_frontier.append(v)
             logger.debug(
                 f"  Hop {hop + 1}: '{graph.nodes[v].get('name', v)}' "
@@ -267,6 +276,19 @@ def _bfs(
             break
         frontier = next_frontier
 
+    # BFS chooses relevant nodes, but discovery edges alone omit relations
+    # between anchors and between nodes selected on the same/earlier hop.
+    # Visit only the selected nodes' outgoing adjacency to retain all induced
+    # relations, including distinct parallel edges, without scanning the graph.
+    subgraph_edges = [
+        (source, target, data)
+        for source in sorted(subgraph_nodes)
+        for _, target, data in graph.out_edges(source, data=True)
+        if target in subgraph_nodes
+        and data.get("relation") not in _LEAF_RELATIONS
+        and graph.nodes[source].get("node_type") != "chunk_ref"
+        and graph.nodes[target].get("node_type") != "chunk_ref"
+    ]
     return subgraph_nodes, subgraph_edges
 
 
@@ -286,6 +308,7 @@ def retrieve_graph(
     threshold = float(cfg.get("relevance_threshold", 0.4))
     max_per_hop = int(cfg.get("max_nodes_per_hop", 10))
     top_k_anchors = int(cfg.get("top_k_anchors", 3))
+    max_chunks = max(1, int(cfg.get("max_chunks", 80)))
     key_term_boost = float(cfg.get("key_term_boost", 0.15))
 
     graph = builder.graph
@@ -294,7 +317,8 @@ def retrieve_graph(
         logger.warning("Graph is empty — returning empty RetrievalResult.")
         return RetrievalResult(chunks=[], subgraph=[], routing_mode="graph")
 
-    anchors = _find_anchors(query, graph, embedder, top_k_anchors, key_term_boost)
+    q_emb = getattr(embedder, "embed_query", embedder.embed_one)(query)
+    anchors = _find_anchors(query, graph, embedder, top_k_anchors, key_term_boost, threshold, query_emb=q_emb)
     if not anchors:
         logger.warning(f"No anchor nodes found for query: '{query[:60]}'")
         return RetrievalResult(chunks=[], subgraph=[], routing_mode="graph")
@@ -303,7 +327,6 @@ def retrieve_graph(
         f"Anchors: {[graph.nodes[k].get('name', k) for k in anchors]}"
     )
 
-    q_emb = embedder.embed_one(query)
     subgraph_nodes, subgraph_edges = _bfs(
         anchors, graph, q_emb, embedder, max_hops, threshold, max_per_hop
     )
@@ -319,17 +342,39 @@ def retrieve_graph(
     ]
 
     # Collect chunk IDs from every subgraph node's source_ids attribute.
-    all_chunk_ids: set[str] = set()
-    for node_key in subgraph_nodes:
-        attrs = graph.nodes[node_key]
-        if attrs.get("node_type") == "chunk_ref":
-            all_chunk_ids.add(node_key)
-        else:
-            all_chunk_ids.update(attrs.get("source_ids", []))
+    all_chunk_ids: dict[str, None] = {}
 
-    chunks: list[Chunk] = [
-        c for cid in all_chunk_ids if (c := store.get_chunk(cid))
-    ]
+    def add_ids(chunk_ids) -> None:
+        for chunk_id in chunk_ids:
+            if len(all_chunk_ids) >= max_chunks:
+                break
+            all_chunk_ids[chunk_id] = None
+
+    # Specific content and relationship evidence should not be crowded out by
+    # broad topics whose source_ids may cover the entire corpus.
+    priority = {"content": 0, "subtopic": 1, "topic": 2, "chunk_ref": 3}
+    added_relation_ids = False
+    for node_key in sorted(subgraph_nodes, key=lambda key: (priority.get(graph.nodes[key].get("node_type"), 3), key)):
+        attrs = graph.nodes[node_key]
+        if attrs.get("node_type") != "content" and not added_relation_ids:
+            for _, _, data in subgraph_edges:
+                add_ids(data.get("source_chunk_ids") or [])
+            added_relation_ids = True
+        if attrs.get("node_type") == "chunk_ref":
+            add_ids([node_key])
+        else:
+            add_ids(attrs.get("source_ids") or [])
+            # Persisted legacy graphs ground content using incoming chunk-ref
+            # leaves. They remain evidence even though BFS never traverses them.
+            for source, _, data in graph.in_edges(node_key, data=True):
+                if data.get("relation") == "EVIDENCE_OF" and graph.nodes[source].get("node_type") == "chunk_ref":
+                    add_ids([source])
+    if not added_relation_ids:
+        for _, _, data in subgraph_edges:
+            add_ids(data.get("source_chunk_ids") or [])
+
+    chunks = [chunk.model_copy(update={"metadata": {**chunk.metadata, "retrieval_source": "graph"}})
+              for chunk in store.get_chunks_by_ids(all_chunk_ids)]
 
     logger.info(
         f"Graph retrieval: {len(subgraph_nodes)} nodes, "

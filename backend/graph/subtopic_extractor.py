@@ -19,6 +19,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel, Field
+
 from backend.graph._llm import resolve_synonym, safe_call_json
 from backend.graph.schema import SubtopicProposal, make_key
 from backend.schemas import Chunk
@@ -27,6 +29,17 @@ if TYPE_CHECKING:
     from backend.retrieval.embedder import Embedder
 
 logger = logging.getLogger(__name__)
+
+
+class _SubtopicPayload(BaseModel):
+    name: str = Field(min_length=1)
+    summary: str
+    parent_topic: str
+    parent_subtopic: str
+
+
+class _SubtopicItems(BaseModel):
+    items: list[_SubtopicPayload]
 
 
 _PROMPT = """\
@@ -84,7 +97,7 @@ def _extract_for_chunk(
         text=chunk.text[:_MAX_TEXT_CHARS],
         max_per_chunk=max_per_chunk,
     )
-    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 600))
+    raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 600), response_model=_SubtopicItems)
     proposals: list[SubtopicProposal] = []
     for entry in raw[:max_per_chunk]:
         try:

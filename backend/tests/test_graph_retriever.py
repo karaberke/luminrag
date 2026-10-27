@@ -53,6 +53,7 @@ def _mock_embedder(relevant_keywords: list[str]) -> MagicMock:
     mock = MagicMock()
     mock.embed.side_effect = _embed
     mock.embed_one.side_effect = _embed_one
+    mock.embed_query.side_effect = _embed_one
     mock.dimension = dim
     return mock
 
@@ -166,17 +167,17 @@ class TestFindAnchors:
             for n in names
         )
 
-    def test_chunk_refs_excluded_from_anchors(self, hierarchical_graph, enzyme_embedder):
-        anchors = _find_anchors(
-            "enzymes", hierarchical_graph.graph, enzyme_embedder, top_k=10,
-        )
-        for k in anchors:
-            assert hierarchical_graph.graph.nodes[k].get("node_type") != "chunk_ref"
-
     def test_empty_graph_returns_empty(self, tmp_path, enzyme_embedder):
         empty = GraphBuilder(tmp_path / "empty.json")
         anchors = _find_anchors("anything", empty.graph, enzyme_embedder, top_k=3)
         assert anchors == []
+
+    def test_topic_without_children_does_not_fill_from_disconnected_nodes(self, tmp_path, enzyme_embedder):
+        builder = GraphBuilder(tmp_path / "unconnected.json")
+        builder.graph.add_node("bio", name="Biochemistry", node_type="topic")
+        builder.graph.add_node("other", name="Enzyme trivia", node_type="content")
+        anchors = _find_anchors("Biochemistry enzymes", builder.graph, enzyme_embedder, top_k=3)
+        assert anchors == ["bio"]
 
     def test_key_term_string_hit_anchors(self, hierarchical_graph, enzyme_embedder):
         # Inject a key_term on a content node whose display name does NOT
@@ -200,6 +201,7 @@ class TestFindAnchors:
         flat.embed_one.side_effect = lambda _: np.array(
             [0.5, 0.5, 0.0, 0.0], dtype=np.float32
         )
+        flat.embed_query.side_effect = flat.embed_one.side_effect
         flat.dimension = 4
 
         ck = make_key("content", "Rate Law")
@@ -226,31 +228,14 @@ class TestBfs:
             max_per_hop=cfg["max_nodes_per_hop"],
         )
 
-    def test_anchor_always_in_subgraph(self, hierarchical_graph, enzyme_embedder, base_config):
+    def test_expansion_keeps_anchor_and_relevant_branch_only(self, hierarchical_graph, enzyme_embedder, base_config):
         anchor = make_key("subtopic", "Enzyme Kinetics")
         nodes, _ = self._run(hierarchical_graph, enzyme_embedder, [anchor],
                              base_config["graph_retriever"])
         assert anchor in nodes
-
-    def test_relevant_neighbours_expanded(self, hierarchical_graph, enzyme_embedder, base_config):
-        anchor = make_key("subtopic", "Enzyme Kinetics")
-        nodes, _ = self._run(hierarchical_graph, enzyme_embedder, [anchor],
-                             base_config["graph_retriever"])
         assert make_key("content", "Michaelis-Menten") in nodes
         assert make_key("content", "Rate Law") in nodes
-
-    def test_irrelevant_branch_pruned(self, hierarchical_graph, enzyme_embedder, base_config):
-        anchor = make_key("subtopic", "Enzyme Kinetics")
-        nodes, _ = self._run(hierarchical_graph, enzyme_embedder, [anchor],
-                             base_config["graph_retriever"])
         assert make_key("content", "Fusion Equation") not in nodes
-
-    def test_chunk_refs_not_in_results(self, hierarchical_graph, enzyme_embedder, base_config):
-        anchor = make_key("content", "Michaelis-Menten")
-        nodes, _ = self._run(hierarchical_graph, enzyme_embedder, [anchor],
-                             base_config["graph_retriever"])
-        for k in nodes:
-            assert hierarchical_graph.graph.nodes[k].get("node_type") != "chunk_ref"
 
     def test_max_hops_zero_returns_only_anchors(self, hierarchical_graph, enzyme_embedder, base_config):
         anchor = make_key("subtopic", "Enzyme Kinetics")
@@ -265,37 +250,27 @@ class TestBfs:
 # ---------------------------------------------------------------------------
 
 class TestRetrieveGraph:
-    def test_returns_retrieval_result(self, hierarchical_graph, store, enzyme_embedder, base_config):
+    def test_retrieval_returns_graph_trace_and_only_relevant_passages(self, hierarchical_graph, store, enzyme_embedder, base_config):
         result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
                                 enzyme_embedder, base_config)
         assert isinstance(result, RetrievalResult)
-
-    def test_routing_mode_is_graph(self, hierarchical_graph, store, enzyme_embedder, base_config):
-        result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
-                                enzyme_embedder, base_config)
         assert result.routing_mode == "graph"
-
-    def test_subgraph_is_list_of_graph_triples(self, hierarchical_graph, store, enzyme_embedder, base_config):
-        result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
-                                enzyme_embedder, base_config)
         assert all(isinstance(t, GraphTriple) for t in result.subgraph)
-
-    def test_subgraph_node_keys_populated(self, hierarchical_graph, store, enzyme_embedder, base_config):
-        result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
-                                enzyme_embedder, base_config)
         assert len(result.subgraph_node_keys) > 0
-
-    def test_relevant_chunks_fetched(self, hierarchical_graph, store, enzyme_embedder, base_config):
-        result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
-                                enzyme_embedder, base_config)
         ids = {c.id for c in result.chunks}
         assert ids & {"c1", "c2"}
+        assert "c3" not in ids
 
-    def test_irrelevant_chunks_excluded(self, hierarchical_graph, store, enzyme_embedder, base_config):
+    def test_legacy_evidence_nodes_never_become_retrieval_anchors_or_trace(self, hierarchical_graph, store, enzyme_embedder, base_config):
+        graph = hierarchical_graph.graph
+        graph.add_node("legacy-ref", name="Enzyme kinetics", node_type="chunk_ref", source_ids=["c1"])
+        graph.add_edge("legacy-ref", make_key("content", "Michaelis-Menten"), relation="EVIDENCE_OF")
+        anchors = _find_anchors("enzyme kinetics", graph, enzyme_embedder, top_k=10)
+        assert "legacy-ref" not in anchors
         result = retrieve_graph("enzyme kinetics", hierarchical_graph, store,
                                 enzyme_embedder, base_config)
-        ids = {c.id for c in result.chunks}
-        assert "c3" not in ids
+        assert "legacy-ref" not in result.subgraph_node_keys
+        assert "c1" in {chunk.id for chunk in result.chunks}
 
     def test_empty_graph_returns_empty(self, tmp_path, store, enzyme_embedder, base_config):
         empty = GraphBuilder(tmp_path / "empty.json")

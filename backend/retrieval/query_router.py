@@ -20,9 +20,17 @@ from __future__ import annotations
 import logging
 import re
 
+from pydantic import BaseModel
+
+from backend.llm import structured
 from backend.schemas import RoutingMode
 
 logger = logging.getLogger(__name__)
+
+
+class _RoutingDecision(BaseModel):
+    mode: RoutingMode
+
 
 # ---------------------------------------------------------------------------
 # Heuristic signal tables
@@ -159,45 +167,26 @@ def _parse_llm_mode(response: str) -> RoutingMode:
 
 
 def _classify_llm_ollama(question: str, cfg: dict) -> RoutingMode:
-    import httpx
-
-    prompt = _LLM_PROMPT.format(question=question)
-    payload = {
-        "model": cfg.get("llm_ollama_model", "llama3.2:3b"),
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_predict": cfg.get("llm_max_tokens", 50)},
-    }
-    base_url = cfg.get("llm_ollama_base_url", "http://localhost:11434")
-    response = httpx.post(f"{base_url}/api/generate", json=payload, timeout=60)
-    response.raise_for_status()
-    return _parse_llm_mode(response.json()["response"])
+    return structured(_LLM_PROMPT.format(question=question) + '\nReturn JSON with a mode field.',
+                      {**cfg, "provider": "ollama"}, _RoutingDecision).mode
 
 
 def _classify_llm_anthropic(question: str, cfg: dict) -> RoutingMode:
-    import anthropic
-
-    client = anthropic.Anthropic()
-    prompt = _LLM_PROMPT.format(question=question)
-    message = client.messages.create(
-        model=cfg.get("llm_anthropic_model", "claude-haiku-4-5-20251001"),
-        max_tokens=cfg.get("llm_max_tokens", 50),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return _parse_llm_mode(message.content[0].text)
+    return structured(_LLM_PROMPT.format(question=question) + '\nReturn JSON with a mode field.',
+                      {**cfg, "provider": "anthropic"}, _RoutingDecision).mode
 
 
 def _classify_llm(question: str, cfg: dict) -> RoutingMode:
-    """Call the configured LLM; fall back to 'dense' on any error."""
-    provider = cfg.get("llm_provider", "ollama")
     try:
+        provider = cfg.get("provider", cfg.get("llm_provider", "ollama"))
         if provider == "ollama":
             return _classify_llm_ollama(question, cfg)
         if provider == "anthropic":
             return _classify_llm_anthropic(question, cfg)
-        raise ValueError(f"Unknown router LLM provider: '{provider}'")
+        return structured(_LLM_PROMPT.format(question=question) + '\nReturn JSON with a mode field.',
+                          cfg, _RoutingDecision).mode
     except Exception as exc:
-        logger.warning(f"LLM routing fallback failed: {exc} — defaulting to 'dense'")
+        logger.warning("LLM routing unavailable (%s); defaulting to dense", type(exc).__name__)
         return "dense"
 
 

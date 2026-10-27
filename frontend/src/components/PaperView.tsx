@@ -1,4 +1,4 @@
-import { useTheme } from '../ThemeContext'
+import { useTheme } from '../theme'
 
 const PAPER_BASE = import.meta.env.VITE_PAPER_PDF ?? '/paper.pdf'
 const PAPER_TITLE = import.meta.env.VITE_PAPER_TITLE ?? 'Research Paper'
@@ -9,9 +9,9 @@ export default function PaperView() {
   const isDark = theme === 'dark'
 
   return (
-    <div className={`flex flex-col flex-1 min-w-0 ${isDark ? 'bg-slate-950' : 'bg-[#f0f4ff]'}`}>
+    <div className={`flex flex-col flex-1 min-w-0 ${isDark ? 'bg-slate-950' : 'bg-[var(--lumin-background)]'}`}>
       <div className={`flex items-center gap-2 px-4 py-2 border-b shrink-0 ${
-        isDark ? 'border-slate-800 bg-slate-900/60' : 'border-[#dde5f5] bg-white/80'
+        isDark ? 'border-slate-800 bg-slate-900/60' : 'border-[var(--lumin-border)] bg-white/80'
       }`}>
         <span className={`text-sm font-medium ${isDark ? 'text-slate-200' : 'text-slate-700'}`}>
           {PAPER_TITLE}

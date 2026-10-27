@@ -17,8 +17,7 @@ import numpy as np
 import pytest
 
 from backend.ingestion.captioners import (
-    AnthropicCaptioner,
-    OllamaCaptioner,
+    LLMCaptioner,
     build_captioner,
 )
 from backend.ingestion.video_transcriber import (
@@ -81,14 +80,27 @@ def synthetic_video(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 class TestBuildCaptioner:
-    def test_returns_ollama_captioner(self, base_config):
+    def test_returns_shared_captioner_for_ollama(self, base_config):
         captioner = build_captioner(base_config)
-        assert isinstance(captioner, OllamaCaptioner)
+        assert isinstance(captioner, LLMCaptioner)
+        assert captioner.cfg["provider"] == "ollama"
+        assert captioner.cfg["ollama_model"] == base_config["captioning"]["ollama_model"]
 
-    def test_returns_anthropic_captioner(self, base_config):
+    def test_returns_shared_captioner_for_anthropic(self, base_config):
         base_config["captioning"]["provider"] = "anthropic"
         captioner = build_captioner(base_config)
-        assert isinstance(captioner, AnthropicCaptioner)
+        assert isinstance(captioner, LLMCaptioner)
+        assert captioner.cfg["provider"] == "anthropic"
+
+    def test_preserves_openrouter_request_key_without_reading_environment(self, base_config, monkeypatch):
+        base_config["captioning"].update(provider="openrouter", api_key="request-owned-key", model="vision-model")
+        complete = MagicMock(return_value="A lecture diagram")
+        monkeypatch.setattr("backend.llm.complete", complete)
+        captioner = build_captioner(base_config)
+        assert captioner.caption(Path("slide.png")) == "A lecture diagram"
+        complete.assert_called_once()
+        assert complete.call_args.args[1]["api_key"] == "request-owned-key"
+        assert complete.call_args.kwargs["images"] == [Path("slide.png")]
 
     def test_unknown_provider_raises(self, base_config):
         base_config["captioning"]["provider"] = "openai"
@@ -101,24 +113,13 @@ class TestBuildCaptioner:
 # ---------------------------------------------------------------------------
 
 class TestExtractKeyframes:
-    def test_detects_scene_change(self, synthetic_video, tmp_path):
+    def test_scene_change_produces_existing_keyframes_with_timestamps(self, synthetic_video, tmp_path):
         kf_dir = tmp_path / "keyframes"
         kf_dir.mkdir()
         keyframes = _extract_keyframes(synthetic_video, kf_dir, threshold=0.85, sample_fps=1)
         assert len(keyframes) >= 1
-
-    def test_keyframe_files_exist(self, synthetic_video, tmp_path):
-        kf_dir = tmp_path / "keyframes"
-        kf_dir.mkdir()
-        keyframes = _extract_keyframes(synthetic_video, kf_dir, threshold=0.85, sample_fps=1)
         for kf in keyframes:
             assert Path(kf["path"]).exists()
-
-    def test_keyframe_has_timestamp(self, synthetic_video, tmp_path):
-        kf_dir = tmp_path / "keyframes"
-        kf_dir.mkdir()
-        keyframes = _extract_keyframes(synthetic_video, kf_dir, threshold=0.85, sample_fps=1)
-        for kf in keyframes:
             assert isinstance(kf["timestamp"], float)
             assert kf["timestamp"] >= 0.0
 

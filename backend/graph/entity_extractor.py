@@ -37,7 +37,10 @@ class GLiNERBackend(BaseNER):
     _OVERLAP_CHARS = 100
 
     def __init__(self, model_name: str, labels: list[str], threshold: float) -> None:
-        from gliner import GLiNER
+        try:
+            from gliner import GLiNER
+        except ImportError:
+            raise RuntimeError("GLiNER is optional. Install the hashed requirements-ner.lock dependencies to use this backend.") from None
         logger.info(f"Loading GLiNER model '{model_name}'…")
         self._model = GLiNER.from_pretrained(model_name)
         self._labels = labels
@@ -63,17 +66,19 @@ class GLiNERBackend(BaseNER):
         segments: list[str] = []
         start = 0
         while start < len(text):
-            end = start + self._MAX_CHARS
+            end = min(len(text), start + self._MAX_CHARS)
             if end < len(text):
                 boundary = max(
                     text.rfind(". ", start, end),
                     text.rfind(".\n", start, end),
                     text.rfind("\n", start, end),
                 )
-                if boundary > start:
+                if boundary > start + self._OVERLAP_CHARS:
                     end = boundary + 1
             segments.append(text[start:end].strip())
-            start = end - self._OVERLAP_CHARS
+            if end == len(text):
+                break
+            start = max(start + 1, end - self._OVERLAP_CHARS)
         return [s for s in segments if s]
 
 
@@ -81,7 +86,10 @@ class SpacyBackend(BaseNER):
     """Classic NER via spaCy. Requires: python -m spacy download <model>."""
 
     def __init__(self, model_name: str) -> None:
-        import spacy
+        try:
+            import spacy
+        except ImportError:
+            raise RuntimeError("spaCy is optional. Install the hashed requirements-ner.lock dependencies to use this backend.") from None
         logger.info(f"Loading spaCy model '{model_name}'…")
         self._nlp = spacy.load(model_name)
 

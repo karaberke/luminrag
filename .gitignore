@@ -33,13 +33,66 @@ pip-delete-this-directory.txt
 .nyc_output/
 
 # --- Local config / credentials ---
-.env
-.env.local
-.env.*.local
-.env.local.example
-.env.staging
-.env.production
+# Keep only reviewed, empty templates; real environment files stay local.
+.env*
+!.env.example
+.envrc
 settings.local.json
+.aws/
+.azure/
+.gcloud/
+.ssh/
+.config/gcloud/
+.npmrc
+.pypirc
+.netrc
+_netrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa*
+id_ed25519*
+credentials.json
+credentials.*.json
+credentials.yaml
+credentials.yml
+secrets/
+secrets.json
+secrets.*.json
+secrets.yaml
+secrets.yml
+passwords.*
+service-account*.json
+service_account*.json
+
+# --- Local coding assistants / agent instructions ---
+.agent/
+.agents/
+.claude/
+.codex/
+.cursor/
+.windsurf/
+.aider*
+.mcp.json
+mcp.json
+[Aa][Gg][Ee][Nn][Tt][Ss].md
+[Aa][Gg][Ee][Nn][Tt][Ss].*.md
+[Cc][Ll][Aa][Uu][Dd][Ee].md
+[Cc][Ll][Aa][Uu][Dd][Ee].*.md
+[Cc][Oo][Dd][Ee][Xx].md
+[Cc][Oo][Dd][Ee][Xx].*.md
+[Gg][Ee][Mm][Ii][Nn][Ii].md
+[Gg][Ee][Mm][Ii][Nn][Ii].*.md
+.cursorrules
+.windsurfrules
+.github/copilot-instructions.md
+.github/instructions/
+.github/agents/
+.github/prompts/
 
 
 # IDE / editors
@@ -80,6 +133,11 @@ frontend/.vite-inspect
 backend/db.sqlite3
 backend/*.db
 backend/data/*
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 
 # --- Logs / misc ---
 *.log
@@ -88,7 +146,8 @@ backend/data/*
 *.bk
 .DS_Store*
 *.local
-CLAUDE.md
+.tmp/
+*.lumin
 
 # --- Optional: large binary / cache ---
 *.zip

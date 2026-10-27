@@ -14,7 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 
+from pydantic import BaseModel, Field
+
+from backend.llm import structured
 from backend.schemas import Chunk, GraphTriple, RetrievalResult
 from backend.retrieval.query_router import route_query
 from backend.retrieval.vector_retriever import retrieve_dense
@@ -22,6 +26,11 @@ from backend.retrieval.graph_retriever import retrieve_graph
 from backend.self_rag.self_rag_reflector import reflect_retrieval
 
 logger = logging.getLogger(__name__)
+
+
+class _Decomposition(BaseModel):
+    sub_questions: list[str] = Field(min_length=1, max_length=8)
+
 
 # ---------------------------------------------------------------------------
 # Decomposition prompt
@@ -46,41 +55,20 @@ Respond with ONLY valid JSON (no markdown fences):
 # ---------------------------------------------------------------------------
 
 def _call_ollama(prompt: str, cfg: dict) -> str:
-    import httpx
-
-    payload = {
-        "model": cfg.get("ollama_model", "llama3.2:3b"),
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"num_predict": cfg.get("max_tokens", 256)},
-    }
-    base_url = cfg.get("ollama_base_url", "http://localhost:11434")
-    response = httpx.post(f"{base_url}/api/generate", json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json()["response"]
+    return structured(prompt, {**cfg, "provider": "ollama"}, _Decomposition).model_dump_json()
 
 
 def _call_anthropic(prompt: str, cfg: dict) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=cfg.get("anthropic_model", "claude-haiku-4-5-20251001"),
-        max_tokens=cfg.get("max_tokens", 256),
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
+    return structured(prompt, {**cfg, "provider": "anthropic"}, _Decomposition).model_dump_json()
 
 
 def _call_llm(prompt: str, cfg: dict) -> str:
-    """Dispatch to the configured LLM provider."""
     provider = cfg.get("provider", "ollama")
     if provider == "ollama":
         return _call_ollama(prompt, cfg)
     if provider == "anthropic":
         return _call_anthropic(prompt, cfg)
-    raise ValueError(f"Unknown multi_hop_reasoner provider: '{provider}'")
+    return structured(prompt, cfg, _Decomposition).model_dump_json()
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +110,7 @@ def _merge_results(results: list[RetrievalResult]) -> RetrievalResult:
     Routing mode is 'hybrid' when both dense and graph evidence are present,
     'graph' if only graph results, 'dense' otherwise.
     """
-    seen_chunk_ids: set[str] = set()
+    chunk_positions: dict[str, int] = {}
     seen_triple_keys: set[tuple] = set()
     seen_node_keys: set[str] = set()
     merged_chunks: list[Chunk] = []
@@ -131,9 +119,17 @@ def _merge_results(results: list[RetrievalResult]) -> RetrievalResult:
 
     for r in results:
         for chunk in r.chunks:
-            if chunk.id not in seen_chunk_ids:
-                seen_chunk_ids.add(chunk.id)
+            if chunk.id not in chunk_positions:
+                chunk_positions[chunk.id] = len(merged_chunks)
                 merged_chunks.append(chunk)
+            else:
+                position = chunk_positions[chunk.id]
+                existing = merged_chunks[position]
+                sources = {existing.metadata.get("retrieval_source"), chunk.metadata.get("retrieval_source")}
+                if "both" in sources or {"dense", "graph"} <= sources:
+                    merged_chunks[position] = existing.model_copy(update={
+                        "metadata": {**existing.metadata, "retrieval_source": "both"},
+                    })
         for triple in r.subgraph:
             key = (triple.head, triple.relation, triple.tail)
             if key not in seen_triple_keys:
@@ -176,8 +172,6 @@ def _retrieve_hybrid(
     graph_result = retrieve_graph(sub_q, graph_builder, store, embedder, config)
 
     graph_ids = {c.id for c in graph_result.chunks}
-    dense_ids = {c.id for c in dense_result.chunks}
-
     tagged_chunks: list[Chunk] = []
     seen: set[str] = set()
 
@@ -222,6 +216,23 @@ def _retrieve_hybrid(
 # Public API
 # ---------------------------------------------------------------------------
 
+def retrieve_for_mode(
+    sub_question: str,
+    mode: str,
+    vector_index,
+    graph_builder,
+    store,
+    embedder,
+    config: dict,
+) -> RetrievalResult:
+    """Dispatch retrieval independently of the decomposition and reflection LLM calls."""
+    if mode == "hybrid":
+        return _retrieve_hybrid(sub_question, vector_index, graph_builder, store, embedder, config)
+    if mode == "graph":
+        return retrieve_graph(sub_question, graph_builder, store, embedder, config)
+    return retrieve_dense(sub_question, vector_index, store, config)
+
+
 def reason(
     question: str,
     vector_index,
@@ -230,6 +241,8 @@ def reason(
     embedder,
     config: dict,
     force_routing_mode: str | None = None,
+    *,
+    retrieve_callback: Callable[[str, str], RetrievalResult] | None = None,
 ) -> RetrievalResult:
     """
     Decompose a complex question, retrieve+reflect per sub-question, merge evidence.
@@ -249,15 +262,21 @@ def reason(
         config:              Parsed config/llm.yaml.
         force_routing_mode:  When set to "dense" or "graph", skip the query router
                              and use this mode for every sub-question.
+        retrieve_callback:   Optional retrieval boundary, called with the sub-question
+                             and routing mode. A server can acquire its state lock,
+                             validate a captured revision, and call retrieve_for_mode
+                             here while the LLM calls run without holding that lock.
+                             Exceptions propagate, so stale work can be rejected.
 
     Returns:
         Merged RetrievalResult. Returns an empty result if nothing passes reflection.
     """
     cfg = config.get("multi_hop_reasoner", {})
-    sub_questions = _decompose(question, cfg)
+    sub_questions = [question] if config.get("query_mode") == "fast" else _decompose(question, cfg)
     logger.debug(f"Decomposed '{question}' → {len(sub_questions)} sub-questions")
 
     results: list[RetrievalResult] = []
+    routed_modes: set[str] = set()
 
     for sub_q in sub_questions:
         if force_routing_mode is not None:
@@ -265,21 +284,20 @@ def reason(
             logger.debug(f"Using forced routing mode '{mode}' for sub-question: {sub_q!r}")
         else:
             mode = route_query(sub_q, config)
+        routed_modes.add(mode)
 
         if mode == "none":
             logger.debug(f"Sub-question routed to 'none', skipping: {sub_q!r}")
             continue
 
-        if mode == "hybrid":
-            result = _retrieve_hybrid(sub_q, vector_index, graph_builder, store, embedder, config)
-        elif mode == "graph":
-            result = retrieve_graph(sub_q, graph_builder, store, embedder, config)
+        if retrieve_callback is not None:
+            result = retrieve_callback(sub_q, mode)
         else:
-            result = retrieve_dense(sub_q, vector_index, store, config)
+            result = retrieve_for_mode(sub_q, mode, vector_index, graph_builder, store, embedder, config)
 
         # When the user forces a retrieval mode, skip the relevance gate — they
         # explicitly chose this path and expect results from it.
-        if force_routing_mode is None:
+        if force_routing_mode is None and config.get("query_mode") != "fast":
             verdict = reflect_retrieval(sub_q, result, config)
             if not verdict.is_relevant:
                 logger.debug(f"Reflection deemed irrelevant, skipping: {sub_q!r}")
@@ -289,7 +307,10 @@ def reason(
 
     if not results:
         logger.warning("No relevant results found across all sub-questions")
-        fallback_mode = force_routing_mode or "dense"
+        # Preserve an intentional conversational route. A failed/irrelevant
+        # retrieval attempt must still reach the source-grounded empty-result
+        # guard rather than silently falling back to general knowledge.
+        fallback_mode = force_routing_mode or ("none" if routed_modes == {"none"} else "dense")
         return RetrievalResult(chunks=[], subgraph=[], routing_mode=fallback_mode, subgraph_node_keys=[])
 
     return _merge_results(results)

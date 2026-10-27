@@ -1,10 +1,14 @@
 import { useRef, useState, type KeyboardEvent } from 'react'
-import { useTheme } from '../ThemeContext'
+import { useTheme } from '../theme'
+import type { QueryRoutingMode } from '../types'
+import type { QuerySettings } from '../utils/query'
 
-export type RoutingMode = 'auto' | 'dense' | 'graph' | 'hybrid'
+export type RoutingMode = QueryRoutingMode
 
 interface Props {
-  onSubmit: (query: string, routingMode: RoutingMode, maxSources?: number, minRelevancy?: number) => void
+  onSubmit: (query: string) => void
+  options: QuerySettings
+  onOptionsChange: (options: QuerySettings) => void
   loading: boolean
   onFirstKeystroke?: () => void
   suggestions?: string[]
@@ -17,13 +21,12 @@ const MODES: { value: RoutingMode; label: string; title: string }[] = [
   { value: 'hybrid', label: 'Hybrid', title: 'Combine dense vector and knowledge-graph retrieval' },
 ]
 
-export default function QueryInput({ onSubmit, loading, onFirstKeystroke, suggestions = [] }: Props) {
+export default function QueryInput({ onSubmit, options, onOptionsChange, loading, onFirstKeystroke, suggestions = [] }: Props) {
   const [value, setValue] = useState('')
   const [showSuggestions, setShowSuggestions] = useState(false)
-  const [routingMode, setRoutingMode] = useState<RoutingMode>('auto')
   const [showOptions, setShowOptions] = useState(false)
-  const [minRelevancy, setMinRelevancy] = useState(0)
-  const [maxSources, setMaxSources] = useState<number | undefined>(undefined)
+  const { routingMode, queryMode, maxSources } = options
+  const minRelevancy = options.minRelevancy ?? 0
   const wasEmptyRef = useRef(true)
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -31,7 +34,7 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
   const submit = () => {
     const trimmed = value.trim()
     if (!trimmed || loading) return
-    onSubmit(trimmed, routingMode, maxSources, minRelevancy > 0 ? minRelevancy : undefined)
+    onSubmit(trimmed)
     setValue('')
     wasEmptyRef.current = true
     setShowSuggestions(false)
@@ -65,7 +68,8 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
   const relevancyLabel = minRelevancy === 0 ? 'No filter' : `${Math.round(minRelevancy * 100)}%`
 
   return (
-    <div className="relative">
+    <div className="lumin-composer relative">
+      <div className="flex items-center gap-2 mb-2 text-xs"><label htmlFor="query-depth" className="text-slate-500">Answer mode</label><select id="query-depth" value={queryMode} onChange={(event) => onOptionsChange({ ...options, queryMode: event.target.value as 'fast' | 'thorough' })} className={`rounded-lg border px-2 py-1 ${isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-300'}`}><option value="fast">Fast · fewer AI calls</option><option value="thorough">Thorough · full verification</option></select></div>
       {/* Suggestions */}
       {showSuggestions && !value && suggestions.length > 0 && (
         <div className={`absolute bottom-full left-0 right-0 mb-2 border rounded-xl overflow-hidden shadow-xl z-10 ${
@@ -107,7 +111,7 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
                 max={1}
                 step={0.05}
                 value={minRelevancy}
-                onChange={(e) => setMinRelevancy(parseFloat(e.target.value))}
+                onChange={(e) => onOptionsChange({ ...options, minRelevancy: parseFloat(e.target.value) })}
                 className="w-full accent-indigo-500 cursor-pointer"
               />
             </label>
@@ -123,7 +127,7 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
                 value={maxSources ?? ''}
                 onChange={(e) => {
                   const v = e.target.value
-                  setMaxSources(v === '' ? undefined : Math.max(1, parseInt(v, 10)))
+                  onOptionsChange({ ...options, maxSources: v === '' ? undefined : Math.max(1, parseInt(v, 10)) })
                 }}
                 className={`w-24 px-2 py-0.5 rounded-lg border text-xs outline-none ${
                   isDark
@@ -136,7 +140,7 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
         </div>
       )}
 
-      <div className={`flex items-end gap-2 border rounded-xl px-3 py-2 transition-colors ${
+      <div className={`lumin-composer-box flex items-end gap-2 border rounded-xl px-3 py-2 transition-colors ${
         isDark
           ? 'bg-slate-800 border-slate-700 focus-within:border-indigo-500'
           : 'bg-white border-slate-300 focus-within:border-indigo-400 shadow-sm'
@@ -154,13 +158,13 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
         )}
 
         {/* Routing mode selector */}
-        <div className={`mb-1 flex items-center rounded-lg border overflow-hidden shrink-0 self-end ${
+        <div className={`lumin-composer-modes mb-1 flex items-center rounded-lg border overflow-hidden shrink-0 self-end ${
           isDark ? 'bg-slate-900 border-slate-700' : 'bg-slate-100 border-slate-200'
         }`}>
           {MODES.map((m) => (
             <button
               key={m.value}
-              onClick={() => setRoutingMode(m.value)}
+              onClick={() => onOptionsChange({ ...options, routingMode: m.value })}
               title={m.title}
               className={`px-2 py-1 text-xs font-medium transition-colors ${modeActiveClass(m.value)}`}
             >
@@ -202,10 +206,10 @@ export default function QueryInput({ onSubmit, loading, onFirstKeystroke, sugges
         <button
           onClick={submit}
           disabled={!value.trim() || loading}
-          className={`mb-1 w-8 h-8 rounded-lg text-white flex items-center justify-center transition-colors shrink-0 ${
+          className={`lumin-send-button mb-1 w-8 h-8 rounded-lg text-white flex items-center justify-center transition-colors shrink-0 ${
             isDark
               ? 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 disabled:text-slate-500'
-              : 'bg-indigo-500 hover:bg-indigo-400 disabled:bg-slate-200 disabled:text-slate-400'
+              : 'bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400'
           }`}
         >
           {loading ? (

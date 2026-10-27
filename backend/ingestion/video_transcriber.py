@@ -15,8 +15,8 @@ Public API:
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
+import math
+import os
 import tempfile
 from pathlib import Path
 
@@ -25,7 +25,13 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
 from backend.ingestion.captioners import BaseCaptioner, build_captioner, safe_caption
+from backend.ingestion.media_limits import decode_audio, transcribe_bounded
 from backend.schemas import Chunk
+from backend.utils.paths import processed_data_dir
+from backend.utils.processes import (
+    MAX_KEYFRAME_BYTES, MAX_KEYFRAMES, MAX_MEDIA_SECONDS, MAX_VIDEO_FRAMES,
+    MAX_VIDEO_PIXELS, MAX_VIDEO_SAMPLES, run_parser,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,40 +40,9 @@ logger = logging.getLogger(__name__)
 # Step 1: Audio extraction
 # ---------------------------------------------------------------------------
 
-_FFMPEG_UNSAFE_CHARS = frozenset("#?%&")
-
-
 def _extract_audio(video_path: Path, tmp_dir: str) -> Path:
     """Strip audio track to a 16 kHz mono WAV using ffmpeg."""
-    # ffmpeg's libavformat treats # (and other URL special chars) as URL
-    # fragment separators, causing [WinError 2] / "No such file" even when
-    # the file exists. Copy to a sanitised temp name to work around this.
-    ffmpeg_input = video_path
-    if _FFMPEG_UNSAFE_CHARS & set(video_path.name):
-        ffmpeg_input = Path(tmp_dir) / f"input{video_path.suffix}"
-        shutil.copy2(video_path, ffmpeg_input)
-
-    audio_path = Path(tmp_dir) / "audio.wav"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(ffmpeg_input),
-        "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        str(audio_path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True)
-    except FileNotFoundError:
-        raise RuntimeError(
-            "ffmpeg not found. Install ffmpeg and ensure it is on your PATH."
-        )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg failed for {video_path}:\n{result.stderr.decode()}"
-        )
-    return audio_path
+    return decode_audio(video_path, tmp_dir, video=True)
 
 
 # ---------------------------------------------------------------------------
@@ -79,20 +54,7 @@ def _transcribe(audio_path: Path, cfg: dict) -> list[dict]:
     Transcribe audio with faster-whisper.
     Returns list of {start: float, end: float, text: str}.
     """
-    from faster_whisper import WhisperModel
-
-    w = cfg["whisper"]
-    model = WhisperModel(
-        w["model_size"],
-        device=w.get("device", "cpu"),
-        compute_type=w.get("compute_type", "int8"),
-    )
-    segments, _ = model.transcribe(str(audio_path), beam_size=5)
-    return [
-        {"start": s.start, "end": s.end, "text": s.text.strip()}
-        for s in segments
-        if s.text.strip()
-    ]
+    return transcribe_bounded(audio_path, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -105,42 +67,94 @@ def _extract_keyframes(
     threshold: float,
     sample_fps: int = 1,
 ) -> list[dict]:
+    """Keep native video decoders and their temporary assets outside the API."""
+    keyframe_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=keyframe_dir) as temporary:
+        frames = run_parser("keyframes", video_path, options={"keyframe_dir": temporary,
+                            "threshold": threshold, "sample_fps": sample_fps})
+        if len(frames) > MAX_KEYFRAMES:
+            raise ValueError("Video keyframe count exceeds the processing limit.")
+        root = Path(temporary).resolve()
+        result = []
+        for frame in frames:
+            source = Path(frame["path"]).resolve()
+            if source.parent != root or source.suffix != ".jpg" or not source.is_file():
+                raise ValueError("Invalid keyframe output.")
+            target = keyframe_dir / source.name
+            os.replace(source, target)
+            result.append({"timestamp": frame["timestamp"], "path": target})
+        return result
+
+
+def _extract_keyframes_local(
+    video_path: Path, keyframe_dir: Path, threshold: float, sample_fps: float = 1,
+) -> list[dict]:
     """
     Sample the video at sample_fps frames/sec and emit a keyframe whenever
     SSIM between consecutive samples drops below threshold.
 
     Returns list of {timestamp: float, path: Path}.
     """
-    cap = cv2.VideoCapture(str(video_path))
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Video similarity threshold must be between zero and one.")
+    if not math.isfinite(sample_fps) or not 0 < sample_fps <= 2:
+        raise ValueError("Video sampling rate must be between zero and two frames per second.")
+    cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
+    native_fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    width, height = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    if (not math.isfinite(native_fps) or not 0 < native_fps <= 120
+            or not math.isfinite(frame_count) or frame_count > MAX_VIDEO_FRAMES
+            or frame_count / native_fps > MAX_MEDIA_SECONDS
+            or not all(math.isfinite(value) for value in (width, height))
+            or width * height > MAX_VIDEO_PIXELS):
+        cap.release()
+        raise ValueError("Video dimensions, frames or duration exceed the processing limit.")
     step = max(1, int(native_fps / sample_fps))
 
     keyframes: list[dict] = []
     prev_gray: np.ndarray | None = None
     frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % step == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            if prev_gray is not None:
-                score, _ = ssim(prev_gray, gray, full=True)
-                if score < threshold:
-                    timestamp = frame_idx / native_fps
-                    kf_path = keyframe_dir / f"frame_{frame_idx:07d}.jpg"
-                    cv2.imwrite(str(kf_path), frame)
-                    keyframes.append({"timestamp": timestamp, "path": kf_path})
-                    logger.debug(f"  Keyframe at {timestamp:.1f}s (SSIM={score:.3f})")
-
-            prev_gray = gray
-
-        frame_idx += 1
-
-    cap.release()
+    samples = output_bytes = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx >= MAX_VIDEO_FRAMES or frame_idx / native_fps > MAX_MEDIA_SECONDS:
+                raise ValueError("Video frames or duration exceed the processing limit.")
+            if frame.shape[0] * frame.shape[1] > MAX_VIDEO_PIXELS:
+                raise ValueError("Video pixel count exceeds the processing limit.")
+            if frame_idx % step == 0:
+                samples += 1
+                if samples > MAX_VIDEO_SAMPLES:
+                    raise ValueError("Video sample count exceeds the processing limit.")
+                ratio = min(1.0, 512 / max(frame.shape[:2]))
+                sample = cv2.resize(frame, None, fx=ratio, fy=ratio) if ratio < 1 else frame
+                gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    if gray.shape != prev_gray.shape:
+                        raise ValueError("Video frame dimensions changed during processing.")
+                    score = ssim(prev_gray, gray)
+                    if score < threshold:
+                        if len(keyframes) >= MAX_KEYFRAMES:
+                            raise ValueError("Video keyframe count exceeds the processing limit.")
+                        timestamp = frame_idx / native_fps
+                        kf_path = keyframe_dir / f"frame_{frame_idx:07d}.jpg"
+                        ratio = min(1.0, 1920 / max(frame.shape[:2]))
+                        image = cv2.resize(frame, None, fx=ratio, fy=ratio) if ratio < 1 else frame
+                        written, encoded = cv2.imencode(".jpg", image)
+                        if not written:
+                            raise ValueError("Video keyframe could not be written.")
+                        output_bytes += encoded.nbytes
+                        if output_bytes > MAX_KEYFRAME_BYTES:
+                            raise ValueError("Video keyframe output exceeds the processing size limit.")
+                        kf_path.write_bytes(encoded.tobytes())
+                        keyframes.append({"timestamp": timestamp, "path": kf_path})
+                prev_gray = gray
+            frame_idx += 1
+    finally:
+        cap.release()
     return keyframes
 
 
@@ -230,7 +244,7 @@ def transcribe_video(video_path: str | Path, config: dict) -> list[Chunk]:
     threshold = kf_cfg.get("ssim_threshold", 0.85)
     sample_fps = kf_cfg.get("sample_fps", 1)
 
-    keyframe_dir = Path("backend/data/processed/keyframes") / source_id
+    keyframe_dir = processed_data_dir(config) / "keyframes" / source_id
     keyframe_dir.mkdir(parents=True, exist_ok=True)
 
     captioner = build_captioner(config)
