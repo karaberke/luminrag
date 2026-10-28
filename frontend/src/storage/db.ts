@@ -5,7 +5,7 @@ export interface WorkspaceRecord { id: string; name: string; bundle?: Blob; vers
 export interface RawFileRecord { id: string; workspaceId: string; name: string; source: string; blob: Blob }
 export interface SettingRecord { id: string; value: unknown }
 export interface ChatRecord { workspaceId: string; messages: Message[] }
-interface PendingOriginals { workspaceId: string; generation: number; files: RawFileRecord[] }
+interface PendingOriginals { workspaceId: string; generation: number; files: RawFileRecord[]; blockedSources?: string[] }
 const PENDING_ORIGINALS_PREFIX = 'pending-originals:'
 
 export const db = new Dexie('luminrag') as Dexie & {
@@ -76,25 +76,30 @@ export async function createWorkspace(name: string): Promise<WorkspaceRecord> {
 
 export async function selectWorkspace(id: string): Promise<void> {
   if (!await db.workspaces.get(id)) throw new Error('Knowledge base not found on this device.')
+  if (id !== activeId) clearUrls()
   activeId = id
   localStorage.setItem(ACTIVE_WORKSPACE_KEY, id)
   await preloadSources()
   window.dispatchEvent(new CustomEvent('lumin-workspace-changed', { detail: id }))
 }
 
-function clearUrls(): void {
-  for (const url of [...sourceUrls.values(), ...assetUrls.values()]) URL.revokeObjectURL(url)
+function clearSourceUrls(): void {
+  for (const url of new Set(sourceUrls.values())) URL.revokeObjectURL(url)
   sourceUrls.clear()
   sourceNames.clear()
+}
+
+function clearUrls(): void {
+  clearSourceUrls()
+  for (const url of assetUrls.values()) URL.revokeObjectURL(url)
   assetUrls.clear()
   passages.clear()
 }
 
-export async function preloadSources(): Promise<void> {
-  const workspaceId = activeId
+export async function preloadSources(workspaceId = activeId): Promise<void> {
   const files = await db.rawFiles.where('workspaceId').equals(workspaceId).toArray()
   if (workspaceId !== activeId) return
-  clearUrls()
+  clearSourceUrls()
   for (const record of files) {
     const safeBlob = safeSourceBlob(record.name, record.blob)
     sourceUrls.set(record.source, URL.createObjectURL(safeBlob))
@@ -143,6 +148,31 @@ export async function saveOriginals(files: File[], workspaceId = activeId): Prom
   if (workspaceId === activeId) await preloadSources()
 }
 
+/** The browser releases this cross-tab admission lease even if its tab closes. */
+export async function withOriginalsLock<T>(workspaceId: string, operation: () => Promise<T>, recoverInterrupted = false): Promise<T> {
+  if (!navigator.locks) throw new Error('This browser cannot safely coordinate uploads. Open LuminRAG over HTTPS in a current browser.')
+  return navigator.locks.request(`lumin-originals:${workspaceId}`, { ifAvailable: true }, async (lock) => {
+    if (!lock) throw new Error('Another tab is uploading or exporting this knowledge base. Wait for it to finish and try again.')
+    if (recoverInterrupted) {
+      const abandoned = await db.settings.where('id').startsWith(`${PENDING_ORIGINALS_PREFIX}${workspaceId}:attempt:`).primaryKeys()
+      if (abandoned.length) {
+        await db.settings.bulkDelete(abandoned)
+        throw new Error('A previous upload was interrupted before its result could be confirmed. Saved originals were kept. Re-upload its files to finish processing; click Upload & Ingest again when ready.')
+      }
+    }
+    return operation()
+  })
+}
+
+export async function pendingIngestJobs(workspaceId = activeId): Promise<string[]> {
+  const prefix = `${PENDING_ORIGINALS_PREFIX}${workspaceId}:job:`
+  return (await db.settings.where('id').startsWith(prefix).primaryKeys()).map((id) => id.slice(prefix.length))
+}
+
+export async function hasPendingOriginals(workspaceId = activeId): Promise<boolean> {
+  return (await db.settings.where('id').startsWith(`${PENDING_ORIGINALS_PREFIX}${workspaceId}:`).count()) > 0
+}
+
 /** Keep an upload's originals separate from committed sources until its job succeeds. */
 export async function stageOriginals(files: File[], workspaceId = activeId): Promise<string> {
   const workspace = await db.workspaces.get(workspaceId)
@@ -153,6 +183,7 @@ export async function stageOriginals(files: File[], workspaceId = activeId): Pro
   await db.transaction('rw', db.settings, db.workspaces, async () => {
     const current = await db.workspaces.get(workspaceId)
     if (!current || (current.generation ?? 0) !== generation) throw new Error('The knowledge base changed during upload. Please try again.')
+    if (await hasPendingOriginals(workspaceId)) throw new Error('This knowledge base already has an upload awaiting completion. Keep it open to finish processing before uploading more files.')
     await db.settings.put({ id, value: pending })
   })
   return id
@@ -178,7 +209,7 @@ export async function bindOriginalsToJob(id: string, jobId: string): Promise<voi
 }
 
 /** Publish only positively committed source IDs in the same, uncleared knowledge base. */
-export async function settleIngestOriginals(jobId: string, ingestedSourceIds: readonly string[] | null | undefined, workspaceId = activeId): Promise<'published' | 'discarded' | 'missing'> {
+export async function settleIngestOriginals(jobId: string, ingestedSourceIds: readonly string[] | null | undefined, workspaceId = activeId): Promise<'published' | 'discarded' | 'missing' | 'ambiguous'> {
   const id = `${PENDING_ORIGINALS_PREFIX}${workspaceId}:job:${jobId}`
   const result = await db.transaction('rw', db.settings, db.rawFiles, db.workspaces, async () => {
     const pending = (await db.settings.get(id))?.value as PendingOriginals | undefined
@@ -186,12 +217,26 @@ export async function settleIngestOriginals(jobId: string, ingestedSourceIds: re
     const workspace = await db.workspaces.get(workspaceId)
     const valid = pending.workspaceId === workspaceId && workspace && (workspace.generation ?? 0) === pending.generation
     const committed = new Set(ingestedSourceIds ?? [])
-    const files = valid ? pending.files.filter((file) => committed.has(file.source)) : []
+    const candidateSources = new Set(pending.files.filter((file) => committed.has(file.source)).map((file) => file.source))
+    const blocked = new Set(pending.blockedSources ?? [])
+    // Old clients could admit overlapping jobs. Without publication ordering,
+    // keep their existing originals rather than publish either ambiguous revision.
+    if (valid) for (const record of await db.settings.where('id').startsWith(`${PENDING_ORIGINALS_PREFIX}${workspaceId}:job:`).toArray()) {
+      const other = record.value as PendingOriginals
+      if (record.id === id || other.generation !== pending.generation) continue
+      const overlaps = other.files.filter((file) => candidateSources.has(file.source)).map((file) => file.source)
+      if (!overlaps.length) continue
+      for (const source of overlaps) blocked.add(source)
+      other.blockedSources = [...new Set([...(other.blockedSources ?? []), ...overlaps])]
+      await db.settings.put({ ...record, value: other })
+    }
+    const files = valid ? pending.files.filter((file) => committed.has(file.source) && !blocked.has(file.source)) : []
     if (files.length) await db.rawFiles.bulkPut(files)
     await db.settings.delete(id)
+    if (valid && pending.files.some((file) => blocked.has(file.source) && committed.has(file.source))) return 'ambiguous' as const
     return files.length ? 'published' as const : 'discarded' as const
   })
-  if (result === 'published' && workspaceId === activeId) {
+  if ((result === 'published' || result === 'ambiguous') && workspaceId === activeId) {
     await preloadSources()
     window.dispatchEvent(new Event('lumin-assets-updated'))
   }

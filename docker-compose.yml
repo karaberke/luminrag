@@ -1,61 +1,95 @@
-services:
-  backend:
-    build: .
-    ports:
-      - "127.0.0.1:8000:8000"
-    env_file: .env
-    environment:
-      LUMINRAG_API_TOKEN: ${LUMINRAG_API_TOKEN:?Set LUMINRAG_API_TOKEN in .env before starting Docker}
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    # Only the root bootstrap repairs legacy volume ownership and uses gosu.
-    # The Python process runs as UID 1000 with no effective capabilities.
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - SETUID
-      - SETGID
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
-      - /app/backend/data/staging:rw,nosuid,nodev,noexec,size=2g,uid=1000,gid=1000,mode=0700
-    volumes:
-      # Persist the SQLite DB, NumPy vectors and graph across restarts.
-      - luminrag_data:/app/backend/data/processed
-      # Source links must survive container replacement as well as the index.
-      - luminrag_raw:/app/backend/data/raw
-      # Mount config so you can tweak LLM settings without rebuilding
-      - ./config:/app/config:ro
-      # Optional Whisper/Hugging Face caches; verified retrieval weights are read-only.
-      - luminrag_cache:/var/cache/luminrag
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=2).close()"]
-      interval: 15s
-      timeout: 3s
-      start_period: 120s
-      retries: 3
+name: ${COMPOSE_PROJECT_NAME:-luminrag}
 
+x-service: &service
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "5m"
+      max-file: "3"
+
+services:
   frontend:
+    <<: *service
     build: ./frontend
-    ports:
-      - "127.0.0.1:80:8080"
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+    cpus: ${LUMIN_FRONTEND_CPUS:-0.25}
+    mem_limit: ${LUMIN_FRONTEND_MEMORY:-192m}
+    memswap_limit: ${LUMIN_FRONTEND_MEMORY:-192m}
+    pids_limit: 64
+    volumes:
+      - ./deploy/compose/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
       - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,uid=101,gid=101,mode=0700
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, 'http://127.0.0.1:8080/']
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  backend:
+    <<: *service
+    build:
+      context: .
+      dockerfile: Dockerfile.hosted
+    network_mode: service:frontend
     depends_on:
+      frontend:
+        condition: service_healthy
+        restart: true
+    cpus: ${LUMIN_BACKEND_CPUS:-1.0}
+    mem_limit: ${LUMIN_BACKEND_MEMORY:-2g}
+    memswap_limit: ${LUMIN_BACKEND_MEMORY:-2g}
+    pids_limit: 256
+    stop_grace_period: 90s
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=${LUMIN_TEMP_SIZE:-768m},mode=1777
+    environment:
+      LUMIN_HOSTED: "1"
+      LUMINRAG_SKIP_DOTENV: "1"
+      HOST: 127.0.0.1
+      PORT: "8000"
+      FORWARDED_ALLOW_IPS: 127.0.0.1
+      ALLOWED_ORIGINS: https://${LUMIN_HOSTNAME:?Set LUMIN_HOSTNAME in .env}
+      LUMIN_MODEL_THREADS: ${LUMIN_MODEL_THREADS:-1}
+      LUMINRAG_MAX_CONCURRENT_INFERENCE: ${LUMINRAG_MAX_CONCURRENT_INFERENCE:-1}
+      LUMIN_MAX_WORKSPACES: ${LUMIN_MAX_WORKSPACES:-2}
+      LUMIN_MAX_WORKSPACE_BYTES: ${LUMIN_MAX_WORKSPACE_BYTES:-67108864}
+      LUMINRAG_MAX_UPLOAD_BYTES: ${LUMINRAG_MAX_UPLOAD_BYTES:-10485760}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=4).close()"]
+      interval: 5s
+      timeout: 5s
+      start_period: 120s
+      retries: 6
+
+  cloudflared:
+    <<: *service
+    image: cloudflare/cloudflared:2026.10.5@sha256:1b1d34d0a9c0bfca9de72db8460d328db3f19edd2b96169114e3e893a97bbe53
+    network_mode: service:frontend
+    depends_on:
+      frontend:
+        condition: service_healthy
+        restart: true
       backend:
         condition: service_healthy
-    restart: unless-stopped
-
-volumes:
-  luminrag_data:
-  luminrag_raw:
-  luminrag_cache:
+        restart: true
+    command: [tunnel, --no-autoupdate, --metrics, '127.0.0.1:2000', run]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Set the dedicated LuminRAG tunnel token in .env}
+    cpus: ${LUMIN_TUNNEL_CPUS:-0.25}
+    mem_limit: ${LUMIN_TUNNEL_MEMORY:-128m}
+    memswap_limit: ${LUMIN_TUNNEL_MEMORY:-128m}
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+    healthcheck:
+      test: [CMD, cloudflared, tunnel, --metrics, '127.0.0.1:2000', ready]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6

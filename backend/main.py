@@ -25,9 +25,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+from backend.utils.environment import hosted_mode
+
 # Load .env from repo root before any SDK imports so API keys are available
 _env_file = Path(__file__).parent.parent / ".env"
-if os.getenv("LUMIN_HOSTED") != "1" and os.getenv("LUMINRAG_SKIP_DOTENV") != "1" and _env_file.exists():
+if not hosted_mode() and os.getenv("LUMINRAG_SKIP_DOTENV") != "1" and _env_file.exists():
     for _line in _env_file.read_text().splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
@@ -91,7 +93,7 @@ from backend.utils.uploads import (
     validate_file,
 )
 from backend.utils.recovery import PublicationOutcome, RecoveryError, RecoveryManager
-from backend.utils.resources import ModelResourcesBusy
+from backend.utils.resources import ModelResourcesBusy, background_model_resources, nonblocking_model_resources
 from backend.utils.inference import MAX_QUERY_CHARACTERS, inference_limited
 from backend.utils.assets import LegacyReplacement, plan_retired_assets, record_derived_asset_dirs
 from backend.utils.provenance import evidence_metadata
@@ -122,7 +124,7 @@ from backend.generation.generator import generate
 from backend.schemas import Chunk, CitationSpan, GenerationResult, RetrievalResult
 from backend.workspace import (
     MAX_BUNDLE_BYTES, MAX_CHUNKS, StateProxy, Workspace, WorkspaceManager,
-    WorkspaceMapping, current_workspace, export_bundle, hosted_mode,
+    WorkspaceMapping, current_workspace, export_bundle,
     import_bundle, request_config, validate_workspace_data, workspace_id,
     copy_workspace_upload,
 )
@@ -458,7 +460,11 @@ class _WorkspaceMiddleware:
             if calls_llm:
                 credentials = get_credentials(req)
                 config_token = request_config.set(apply_credentials(state.config, credentials))
-            await self.app(scope, receive, send)
+            if hosted_mode():
+                with nonblocking_model_resources():
+                    await self.app(scope, receive, send)
+            else:
+                await self.app(scope, receive, send)
         except HTTPException as exc:
             await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(scope, receive, send)
         finally:
@@ -670,7 +676,8 @@ _background_tasks: set[asyncio.Task] = set()
 
 def _spawn(coro) -> None:
     """Start a background task and keep a strong reference until it finishes."""
-    task = asyncio.create_task(coro)
+    with background_model_resources():
+        task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -1195,6 +1202,8 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
     all_chunks: list[Chunk] = []
     failed: list[str] = []
     for item in staged:
+        if not run_locked(_ingest_snapshot_current, job, snapshot, epoch):
+            return
         job.progress_stage = f"Chunking {item.filename}…"
         try:
             chunks = _parse_staged_file(item, snapshot.config)

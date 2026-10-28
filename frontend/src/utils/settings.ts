@@ -1,27 +1,44 @@
 import { db, initializeStorage } from '../storage/db'
 
 export type LlmProvider = 'openrouter' | 'anthropic' | 'ollama'
-export interface LlmSettings { provider: LlmProvider; key: string; fastModel: string; smartModel: string; remember: boolean }
+export interface LlmSettings { provider: LlmProvider; key: string; fastModel: string; smartModel: string }
 export const MODEL_DEFAULTS = {
   openrouter: { fastModel: 'anthropic/claude-haiku-4.5', smartModel: 'anthropic/claude-sonnet-4.6' },
   anthropic: { fastModel: 'claude-haiku-4-5', smartModel: 'claude-sonnet-4-6' },
   ollama: { fastModel: 'llama3.2', smartModel: 'llama3.2' },
 }
-let current: LlmSettings = { provider: 'openrouter', key: '', remember: false, ...MODEL_DEFAULTS.openrouter }
+let current: LlmSettings = { provider: 'openrouter', key: '', ...MODEL_DEFAULTS.openrouter }
 let loaded: Promise<void> | undefined
+function modelPreferences(value: unknown): Omit<LlmSettings, 'key'> {
+  const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const provider = saved.provider === 'anthropic' || saved.provider === 'ollama' ? saved.provider : 'openrouter'
+  const defaults = MODEL_DEFAULTS[provider]
+  return {
+    provider,
+    fastModel: typeof saved.fastModel === 'string' && saved.fastModel.trim() ? saved.fastModel.trim() : defaults.fastModel,
+    smartModel: typeof saved.smartModel === 'string' && saved.smartModel.trim() ? saved.smartModel.trim() : defaults.smartModel,
+  }
+}
 export function getLlmSettings(): LlmSettings { return current }
 export async function loadLlmSettings(): Promise<void> {
   if (typeof indexedDB === 'undefined') return
   loaded ??= (async () => {
     await initializeStorage()
     const record = await db.settings.get('llm')
-    if (record) current = { ...current, ...(record.value as Partial<LlmSettings>) }
+    if (record) {
+      const preferences = modelPreferences(record.value)
+      // Overwrite legacy saved credentials without ever restoring them to this tab.
+      await db.settings.put({ id: 'llm', value: preferences })
+      current = { ...preferences, key: current.key }
+    }
   })()
   return loaded
 }
 export async function saveLlmSettings(settings: LlmSettings): Promise<void> {
-  current = settings
-  await db.settings.put({ id: 'llm', value: { ...settings, key: settings.remember ? settings.key : '' } })
+  await loadLlmSettings()
+  const preferences = modelPreferences(settings)
+  await db.settings.put({ id: 'llm', value: preferences })
+  current = { ...preferences, key: typeof settings.key === 'string' ? settings.key : '' }
   window.dispatchEvent(new Event('lumin-settings-changed'))
 }
 export function llmHeaders(): Record<string, string> {
@@ -68,6 +85,6 @@ async function exchangeOpenRouterCode(): Promise<boolean> {
   if (!response.ok) throw new Error('OpenRouter could not complete the connection. Try again.')
   const data = await response.json() as { key?: string }
   if (!data.key) throw new Error('OpenRouter did not return an API key.')
-  await saveLlmSettings({ provider: 'openrouter', key: data.key, remember: false, ...MODEL_DEFAULTS.openrouter })
+  await saveLlmSettings({ provider: 'openrouter', key: data.key, ...MODEL_DEFAULTS.openrouter })
   return true
 }

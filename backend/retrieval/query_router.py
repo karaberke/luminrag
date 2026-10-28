@@ -51,6 +51,7 @@ _GREETING_PREFIXES = (
     "hi ", "hello", "hey ", "thanks", "thank you", "ok", "okay",
     "good morning", "good afternoon", "good evening",
 )
+_GREETING_RE = re.compile(r"^(?:" + "|".join(re.escape(g.strip()) for g in _GREETING_PREFIXES) + r")\b")
 
 # Questions that map deterministically to "dense" (single-hop factual).
 _DENSE_PREFIXES = (
@@ -122,12 +123,13 @@ def _classify_heuristic(question: str) -> RoutingMode | None:
         return "dense"
 
     # Greetings / small talk
-    if any(q_lower.startswith(g) for g in _GREETING_PREFIXES):
+    if _GREETING_RE.match(q_lower):
         return "none"
 
-    # Trivially short with no recognised pattern
+    # A short topic name still needs source retrieval; length alone cannot
+    # make a domain term an unsourced general-conversation request.
     if len(_content_words(q)) < 3:
-        return "none"
+        return "dense"
 
     return None  # ambiguous — defer to LLM
 

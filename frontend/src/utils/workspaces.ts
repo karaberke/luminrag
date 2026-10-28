@@ -1,6 +1,6 @@
 import { zipSync, strFromU8, strToU8 } from 'fflate'
 import { readBoundedArchive, type ArchiveLimits } from './archive'
-import { activeWorkspaceId, cacheAsset, cachePassages, createWorkspace, db, initializeStorage, preloadSources, selectWorkspace, workspaceGeneration } from '../storage/db'
+import { activeWorkspaceId, cacheAsset, cachePassages, createWorkspace, db, hasPendingOriginals, initializeStorage, preloadSources, selectWorkspace, withOriginalsLock, workspaceGeneration } from '../storage/db'
 import { apiJson, apiRequest, registerHydrator } from './api'
 
 const hydration = new Map<string, Promise<void>>()
@@ -128,6 +128,11 @@ export function scheduleWorkspaceSave(id = activeWorkspaceId()): void {
 
 export async function exportWorkspace(): Promise<void> {
   const id = activeWorkspaceId()
+  return withOriginalsLock(id, () => exportCommittedWorkspace(id))
+}
+
+async function exportCommittedWorkspace(id: string): Promise<void> {
+  if (await hasPendingOriginals(id)) throw new Error('Wait for this knowledge base\'s upload to finish before exporting. If an upload was interrupted, reopen Upload and re-upload its files first.')
   await saveWorkspaceBundle(id)
   const record = await db.workspaces.get(id)
   if (!record?.bundle) throw new Error('There is no saved knowledge base to export.')

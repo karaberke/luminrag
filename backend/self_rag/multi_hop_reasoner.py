@@ -297,7 +297,7 @@ def reason(
 
         # When the user forces a retrieval mode, skip the relevance gate — they
         # explicitly chose this path and expect results from it.
-        if force_routing_mode is None and config.get("query_mode") != "fast":
+        if force_routing_mode is None and config.get("query_mode") != "fast" and any(chunk.text.strip() for chunk in result.chunks):
             verdict = reflect_retrieval(sub_q, result, config)
             if not verdict.is_relevant:
                 logger.debug(f"Reflection deemed irrelevant, skipping: {sub_q!r}")

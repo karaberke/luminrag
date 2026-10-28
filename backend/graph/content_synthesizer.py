@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, Field
 
 from backend.graph._llm import resolve_synonym, safe_call_json
-from backend.graph.schema import ContentProposal, ContentType, Illustration
+from backend.graph.schema import ContentProposal, ContentType, Illustration, MAX_ILLUSTRATION_HINT
 from backend.schemas import Chunk
 
 if TYPE_CHECKING:
@@ -134,7 +134,7 @@ def _illustration_from(entry: dict) -> Illustration | None:
     hint = str(entry.get("illustration_hint", "")).strip()
     if kind not in _ILLUSTRATION_KINDS or not hint:
         return None
-    return Illustration(kind=kind, hint=hint)  # type: ignore[arg-type]
+    return Illustration(kind=kind, hint=hint[:MAX_ILLUSTRATION_HINT])  # type: ignore[arg-type]
 
 
 def synthesize_contents(

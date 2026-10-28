@@ -28,7 +28,7 @@ export default function SettingsModal({ onClose, hosted = true, required = false
     return () => controller.abort()
   }, [settings.provider])
 
-  const chooseProvider = (provider: LlmProvider) => setSettings({ provider, key: '', remember: settings.remember, ...MODEL_DEFAULTS[provider] })
+  const chooseProvider = (provider: LlmProvider) => setSettings({ provider, key: '', ...MODEL_DEFAULTS[provider] })
   const save = async () => {
     setSaving(true)
     setError(null)
@@ -57,9 +57,9 @@ export default function SettingsModal({ onClose, hosted = true, required = false
       <datalist id="lumin-models">{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
       <div className="grid gap-4 sm:grid-cols-2">{(['fastModel', 'smartModel'] as const).map((field) => <label key={field} className="block text-sm space-y-2"><span>{field === 'fastModel' ? 'Fast model' : 'Smart model'}</span><input list={settings.provider === 'openrouter' ? 'lumin-models' : undefined} value={settings[field]} onChange={(event) => setSettings({ ...settings, [field]: event.target.value })} className={input} spellCheck={false} /><span className="block text-xs text-slate-500">{field === 'fastModel' ? 'Extraction, routing and reflection' : 'Answers and explanations'}</span></label>)}</div>
       {lacksVision && <p className="text-xs text-amber-500">One of these models does not accept images. Choose a vision model to caption diagrams and image uploads.</p>}
-      <label className="flex gap-2 items-start text-sm"><input type="checkbox" checked={settings.remember} onChange={(event) => setSettings({ ...settings, remember: event.target.checked })} className="mt-1 accent-indigo-500" /><span>Remember the key on this device<span className="block text-xs text-slate-500">Stored in this browser. Only enable on a device you trust. Otherwise the key is forgotten when the page closes.</span></span></label>
+      <p className="text-sm text-slate-500">Your API key stays in this tab’s memory and is sent securely when AI processing is needed. It is never saved. Reconnect after refreshing or reopening the page.</p>
       {error && <p role="alert" className="text-sm text-red-500">{error}</p>}
-      <button onClick={save} disabled={saving || !secure} className="w-full bg-indigo-600 text-white rounded-xl py-2.5 disabled:opacity-40">{saving ? 'Saving…' : 'Save and continue'}</button>
+      <button onClick={save} disabled={saving || !secure} className="w-full bg-indigo-600 text-white rounded-xl py-2.5 disabled:opacity-40">{saving ? 'Applying…' : 'Apply and continue'}</button>
       <p className="text-xs text-slate-500">LuminRAG is open source under AGPL-3.0. <a className="text-indigo-400 underline" href="https://github.com/karaberke/luminrag" target="_blank" rel="noreferrer">View source</a></p>
       {!hosted && required && <button onClick={onClose} className="w-full text-xs text-slate-500">Use self-hosted server settings</button>}
     </div>

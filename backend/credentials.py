@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import os
 import re
 from typing import Literal
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from backend.utils.environment import hosted_mode
 
 Provider = Literal["anthropic", "openrouter", "ollama"]
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
@@ -28,7 +29,7 @@ class LLMCredentials(BaseModel):
 
 
 def is_hosted() -> bool:
-    return os.getenv("LUMIN_HOSTED", "0") == "1"
+    return hosted_mode()
 
 
 def get_credentials(request: Request) -> LLMCredentials | None:

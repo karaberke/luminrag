@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 import uuid
@@ -11,6 +10,8 @@ from collections import OrderedDict
 
 from starlette.datastructures import MutableHeaders
 from starlette.responses import JSONResponse
+
+from backend.utils.environment import hosted_mode
 
 JSON_BODY_LIMIT = 2 * 1024 * 1024
 # Match the portable bundle bound plus multipart framing. A single admission
@@ -32,7 +33,7 @@ class HostedSecurityMiddleware:
 
     def __init__(self, app, *, body_idle_seconds=BODY_IDLE_SECONDS, body_total_seconds=BODY_TOTAL_SECONDS):
         self.app = app
-        self.hosted = os.getenv("LUMIN_HOSTED") == "1"
+        self.hosted = hosted_mode()
         self.body_idle_seconds = max(0.001, float(body_idle_seconds))
         self.body_total_seconds = max(0.001, float(body_total_seconds))
         self.import_slots = threading.BoundedSemaphore(1)
@@ -79,7 +80,7 @@ class HostedSecurityMiddleware:
             peer = (scope.get("client") or ("unknown", 0))[0]
             workspace = dict(scope.get("headers", ())).get(b"x-workspace-id", b"").decode("ascii", "ignore")[:36]
             category = "upload" if path in {"/api/ingest", "/api/workspace/import"} else (
-                "compute" if path in {"/api/query", "/api/graph/duplicates"} else "all"
+                "compute" if path in {"/api/query", "/api/graph/duplicates", "/api/graph/ops"} else "all"
             )
             # Rotating a capability cannot reset the socket peer's category budget.
             allowed = self.limiter.hit(self.rates["all"], peer, "all")

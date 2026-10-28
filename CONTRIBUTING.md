@@ -10,11 +10,15 @@ Start with the [local setup](docs/getting-started.md) and [architecture](code_lo
 3. Run the relevant checks below and describe what you verified in the pull request.
 4. Use a short, descriptive commit subject such as `fix: preserve citations when replacing a source`.
 
-The `.env.example` files contain empty settings and local URLs only. They are the only environment templates intended for version control. Git ignore rules do not remove files that were already tracked: inspect both `git status --short` and `git diff --cached` before publishing.
+The reviewed environment templates (`.env.example`, `.env.selfhost.example`, and `frontend/.env.example`) contain example settings and no credentials. Real environment files stay local. Git ignore rules do not remove files that were already tracked: inspect both `git status --short` and `git diff --cached` before publishing.
 
 Report vulnerabilities using the [security policy](SECURITY.md), without including live credentials in a public issue.
 
 ## Verify
+
+The maintainer keeps the regression and security test suites locally; they are
+excluded from the published repository and deployment images. In a checkout
+with those local suites available, run:
 
 ```powershell
 .venv/Scripts/python.exe -m pytest backend/tests -q

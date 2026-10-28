@@ -40,6 +40,11 @@ from backend.graph.schema import (
     STRUCTURAL_RELATIONS,
     ContentAttrs,
     ContentProposal,
+    EdgeInput,
+    MAX_GRAPH_PARENTS,
+    MAX_GRAPH_REFERENCES,
+    NodeInput,
+    NODE_SCHEMA_VERSION,
     NodeAttrs,
     ProposalBundle,
     SubtopicAttrs,
@@ -48,6 +53,11 @@ from backend.graph.schema import (
     TopicProposal,
     _now_iso,
     make_key,
+    bounded_key_terms,
+    legacy_node_schema,
+    normalize_legacy_node_attrs,
+    normalize_legacy_edge_attrs,
+    validate_node_attrs,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +97,7 @@ class GraphBuilder:
     def __init__(self, graph_path: str | Path) -> None:
         self._path = Path(graph_path)
         self._graph: nx.MultiDiGraph = nx.MultiDiGraph()
+        self._graph.graph["node_schema_version"] = NODE_SCHEMA_VERSION
         if self._path.exists():
             self.load()
 
@@ -96,6 +107,7 @@ class GraphBuilder:
 
     def save(self) -> None:
         normalize_associations(self._graph)
+        self._graph.graph["node_schema_version"] = NODE_SCHEMA_VERSION
         data = nx.node_link_data(self._graph)
         atomic_write_text(self._path, json.dumps(data, indent=2))
         logger.info(
@@ -112,8 +124,21 @@ class GraphBuilder:
     def load(self) -> None:
         with open(self._path, encoding="utf-8") as f:
             data = json.load(f)
-        self._graph = nx.node_link_graph(data, directed=True, multigraph=True)
-        normalize_associations(self._graph)
+        graph = nx.node_link_graph(data, directed=True, multigraph=True)
+        legacy = legacy_node_schema(graph.graph.get("node_schema_version"))
+        for _, attrs in graph.nodes(data=True):
+            if legacy:
+                attrs.update(normalize_legacy_node_attrs(attrs))
+            else:
+                validate_node_attrs(attrs)
+        for _, _, attrs in graph.edges(data=True):
+            if legacy:
+                attrs.update(normalize_legacy_edge_attrs(attrs))
+            else:
+                EdgeInput.model_validate(attrs)
+        normalize_associations(graph)
+        graph.graph["node_schema_version"] = NODE_SCHEMA_VERSION
+        self._graph = graph
         logger.info(
             f"Graph loaded from {self._path} "
             f"({self.node_count()} nodes, {self.edge_count()} edges)"
@@ -150,6 +175,7 @@ class GraphBuilder:
           content:            keep original title + created_at; longer summary wins;
                               illustration preserved if set; parent_subtopic_keys union.
         """
+        NodeInput.model_validate(attrs.to_graph_dict())
         key = make_key(attrs.node_type, attrs.name)
 
         if key not in self._graph:
@@ -173,25 +199,20 @@ class GraphBuilder:
 
         if isinstance(attrs, SubtopicAttrs):
             existing_parents = existing.setdefault("parent_topic_keys", [])
-            _merge_source_ids(existing_parents, attrs.parent_topic_keys)
+            _merge_source_ids(existing_parents, attrs.parent_topic_keys, MAX_GRAPH_PARENTS)
 
         if isinstance(attrs, ContentAttrs):
             if attrs.content_type != "other" and existing.get("content_type") == "other":
                 existing["content_type"] = attrs.content_type
             existing_parents = existing.setdefault("parent_subtopic_keys", [])
-            _merge_source_ids(existing_parents, attrs.parent_subtopic_keys)
+            _merge_source_ids(existing_parents, attrs.parent_subtopic_keys, MAX_GRAPH_PARENTS)
 
             # raw_excerpt: keep the longer verbatim quote
             if len(attrs.raw_excerpt) > len(existing.get("raw_excerpt", "")):
                 existing["raw_excerpt"] = attrs.raw_excerpt
 
             # key_terms: union, preserve order, case-insensitive dedup
-            existing_terms = existing.setdefault("key_terms", [])
-            seen = {t.lower() for t in existing_terms}
-            for term in attrs.key_terms:
-                if term and term.lower() not in seen:
-                    existing_terms.append(term)
-                    seen.add(term.lower())
+            existing["key_terms"] = bounded_key_terms([*existing.get("key_terms", []), *attrs.key_terms])
 
             # illustration_path: never overwrite a generated image
             if attrs.illustration_path and not existing.get("illustration_path"):
@@ -209,6 +230,7 @@ class GraphBuilder:
             return False
         allowed = {"name", "summary", "scope", "content_type", "raw_excerpt", "key_terms", "source_ids"}
         node = self._graph.nodes[key]
+        NodeInput.model_validate({**node, **{field: value for field, value in updates.items() if field in allowed}})
         for field, value in updates.items():
             if field in allowed:
                 node[field] = value
@@ -248,6 +270,7 @@ class GraphBuilder:
             )
 
         chunk_ids = list(source_chunk_ids or [])
+        EdgeInput.model_validate({"relation": relation, "source_chunk_ids": chunk_ids})
         existing = self._graph.get_edge_data(source_key, target_key) or {}
         for edge_data in existing.values():
             if edge_data.get("relation") == relation:
@@ -308,11 +331,16 @@ class GraphBuilder:
             normalize_association_pair(self._graph, source, target)
         retained, removed = self._graph.nodes[keep], self._graph.nodes[drop]
         previous_note_text = (retained.get("title") or retained.get("name"), retained.get("body", ""))
-        for field in ("source_ids", "key_terms", "parent_topic_keys", "parent_subtopic_keys"):
-            _merge_source_ids(retained.setdefault(field, []), removed.get(field, []))
+        merged = deepcopy(retained)
+        for field in ("source_ids", "parent_topic_keys", "parent_subtopic_keys"):
+            _merge_source_ids(merged.setdefault(field, []), removed.get(field, []),
+                              MAX_GRAPH_REFERENCES if field == "source_ids" else MAX_GRAPH_PARENTS)
+        merged["key_terms"] = bounded_key_terms([*retained.get("key_terms", []), *removed.get("key_terms", [])])
         for field in ("summary", "raw_excerpt", "body"):
-            if len(removed.get(field) or "") > len(retained.get(field) or ""):
-                retained[field] = removed[field]
+            if len(removed.get(field) or "") > len(merged.get(field) or ""):
+                merged[field] = removed[field]
+        NodeInput.model_validate(merged)
+        retained.update(merged)
         invalidated = {"note:" + drop} if removed.get("node_type") == "note" else set()
         if retained.get("node_type") == "note" and previous_note_text != (retained.get("title") or retained.get("name"), retained.get("body", "")):
             invalidated.add("note:" + keep)
@@ -629,12 +657,11 @@ class GraphBuilder:
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
-def _merge_source_ids(container: list[str], new_ids: list[str]) -> None:
-    existing = set(container)
-    for cid in new_ids:
-        if cid and cid not in existing:
-            container.append(cid)
-            existing.add(cid)
+def _merge_source_ids(container: list[str], new_ids: list[str], max_items: int = MAX_GRAPH_REFERENCES) -> None:
+    merged = list(dict.fromkeys([*container, *(cid for cid in new_ids if cid)]))
+    if len(merged) > max_items:
+        raise ValueError("Graph reference limit exceeded; citations and parents were not truncated.")
+    container[:] = merged
 
 
 def _norm_lookup(name: str) -> str:

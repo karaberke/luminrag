@@ -4,16 +4,18 @@ from pathlib import Path
 
 import uvicorn
 
+from backend.utils.environment import hosted_mode
+
 
 def main() -> None:
-    hosted = os.getenv("LUMIN_HOSTED") == "1"
     env_file = Path(__file__).parent.parent / ".env"
-    if not hosted and os.getenv("LUMINRAG_SKIP_DOTENV") != "1" and env_file.exists():
+    if not hosted_mode() and os.getenv("LUMINRAG_SKIP_DOTENV") != "1" and env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key.strip(), value.strip())
+    hosted = hosted_mode()
     uvicorn.run(
         "backend.main:app",
         host=os.getenv("HOST", "0.0.0.0" if hosted else "127.0.0.1"),

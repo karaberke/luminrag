@@ -66,6 +66,12 @@ The frontend uses React, TypeScript, Sigma and IndexedDB. The Python service use
 
 ## Quick start
 
+For a public Docker deployment, copy `.env.example` to `.env`, set your hostname
+and the token of a dedicated Cloudflare Tunnel, then run
+`docker compose up -d --build --wait --wait-timeout 300`.
+The [deployment guide](docs/deployment.md) covers the one-time dashboard route.
+Docker supplies Python and Node; host installations are not required.
+
 Requires **Python 3.12+**, **Node.js 22+** and **pnpm 10**. Run from the repository root in PowerShell:
 
 ```powershell
@@ -88,7 +94,7 @@ The launcher starts both services in temporary-workspace mode. Use `-SelfHosted`
 - **Browser storage:** Knowledge bases, original files and chats live in IndexedDB. Export backups before clearing browser data.
 - **Temporary hosted compute:** The service parses material, builds embeddings and runs retrieval in isolated temporary workspaces. It can restore compute state from your browser when its cache expires.
 - **Your provider:** Prompts and relevant source context go to the AI provider you select. Use HTTPS for remote deployments.
-- **Key handling:** Keys remain in browser memory unless you choose to remember them on the device. They are sent when provider work is needed and are excluded from workspace backups.
+- **Key handling:** Provider keys are held in the current tab's memory and temporarily in server memory while processing requests. They are sent over HTTPS and never written to browser storage, server storage, logs or workspace backups. Closing the tab clears its copy.
 - **Local files:** Actual `.env` files, credential files, local datasets and agent instructions are excluded from Git. The committed `.env.example` templates contain no keys.
 
 Read the [security policy](SECURITY.md) and [deployment guide](docs/deployment.md) before exposing a service publicly.

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTheme } from '../theme'
 import { ApiError, apiJson, errorMessage, isAbortError } from '../utils/api'
-import { activeWorkspaceId, bindOriginalsToJob, discardStagedOriginals, stageOriginals } from '../storage/db'
+import { activeWorkspaceId, bindOriginalsToJob, discardStagedOriginals, stageOriginals, withOriginalsLock } from '../storage/db'
 
 interface UploadModalProps {
   onClose: () => void
@@ -117,14 +117,18 @@ export default function UploadModal({ onClose, onJobStarted }: UploadModalProps)
       if (unsupported) throw new Error(`Unsupported file: ${unsupported.file.name}`)
       if (snapshot.some(({ file }) => file.size > maxBytes)) throw new Error(`Files must be no larger than ${Math.round(maxBytes / 1024 / 1024)} MB.`)
       setStage('uploading')
-      stagedOriginals = await stageOriginals(snapshot.map(({ file }) => file), workspaceId)
-      if (controller.signal.aborted) { await discardStagedOriginals(stagedOriginals); stagedOriginals = null; return }
-      const jobId = await ingestDirect(snapshot, controller.signal, workspaceId)
-      await bindOriginalsToJob(stagedOriginals, jobId)
-      stagedOriginals = null
-      // Hand off to App immediately — App owns all polling from here
-      onJobStarted(jobId, workspaceId)
-      setStage('done')
+      await withOriginalsLock(workspaceId, async () => {
+        if (controller.signal.aborted) return
+        stagedOriginals = await stageOriginals(snapshot.map(({ file }) => file), workspaceId)
+        if (controller.signal.aborted) { await discardStagedOriginals(stagedOriginals); stagedOriginals = null; return }
+        setStage('starting')
+        const jobId = await ingestDirect(snapshot, controller.signal, workspaceId)
+        await bindOriginalsToJob(stagedOriginals, jobId)
+        stagedOriginals = null
+        // Hand off to App immediately — App owns all polling from here.
+        onJobStarted(jobId, workspaceId)
+        setStage('done')
+      }, true)
     } catch (e) {
       if (stagedOriginals) await discardStagedOriginals(stagedOriginals).catch(() => {})
       if (controller.signal.aborted || isAbortError(e)) return

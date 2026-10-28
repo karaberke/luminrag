@@ -17,7 +17,7 @@ Security fixes target the current `main` branch. There is no separate long-term 
 - Hosted workspace IDs are bearer capabilities. Keep them out of URLs, screenshots, issue reports and logs.
 - Knowledge bases and original documents persist in browser storage; keep `.lumin` backups in a location appropriate for their contents.
 - Provider keys belong in local environment settings or the application's AI settings. Never commit them. Frontend build variables are public and must not contain secrets.
-- The `.env.example` files are intentionally empty templates. Real environment files, private keys, local data and assistant configuration are ignored by Git and excluded from container builds.
+- The reviewed `.env.example` and `.env.selfhost.example` templates contain example settings and no credentials. Real environment files, private keys, local data and assistant configuration are ignored by Git and excluded from container builds.
 - Parser limits reduce resource abuse; they are not an operating-system isolation boundary against unknown native-parser exploits.
 
 See [deployment](docs/deployment.md) and [configuration](docs/reference.md) for the implemented limits and operational requirements.

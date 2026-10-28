@@ -31,6 +31,7 @@ import re
 
 from backend.llm import structured
 from backend.schemas import ReflectionVerdict, RetrievalResult
+from backend.utils.context import DEFAULT_GENERATION_CONTEXT_CHARS, format_context as _format_context
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +93,7 @@ Evaluate and respond with ONLY valid JSON (no markdown fences):
 
 1. needs_retrieval: Was external context necessary to answer this question?
 2. is_relevant: Is the retrieved context relevant to the question?
-3. is_supported: Does the generated answer remain consistent with the retrieved \
-context? Set to false ONLY if the answer directly contradicts the retrieved \
-context or fabricates specific facts (e.g. wrong names, figures, or claims) that \
-conflict with what the sources say. Supplementing the context with accurate \
-general background knowledge is acceptable and should NOT be penalised.
+3. is_supported: {support_criterion}
 4. is_useful: Does the generated answer directly and substantively address the \
 student's question?
 
@@ -109,32 +106,6 @@ Required JSON format:
   "reasoning": "<one concise sentence>"
 }}\
 """
-
-# ---------------------------------------------------------------------------
-# Context formatter
-# ---------------------------------------------------------------------------
-
-def _format_context(result: RetrievalResult, max_chars: int) -> str:
-    """
-    Format RetrievalResult chunks as a numbered list, truncated to max_chars.
-    Returns a placeholder string when no chunks are available.
-    """
-    if not result.chunks:
-        return "(no context retrieved)"
-
-    lines: list[str] = []
-    total = 0
-
-    for i, chunk in enumerate(result.chunks, start=1):
-        line = f"[{i}] ({chunk.modality}) {chunk.text}"
-        if total + len(line) > max_chars:
-            lines.append(f"[{i}] ... (truncated — context limit reached)")
-            break
-        lines.append(line)
-        total += len(line)
-
-    return "\n\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # JSON parsing
@@ -248,11 +219,18 @@ def reflect_answer(
         ReflectionVerdict with all four fields populated.
     """
     cfg = config.get("self_rag", {})
-    max_chars = cfg.get("max_context_chars", 2000)
-
-    context = _format_context(retrieval_result, max_chars)
+    max_chars = config.get("generator", {}).get("max_context_chars", DEFAULT_GENERATION_CONTEXT_CHARS)
+    conversation = retrieval_result.routing_mode == "none"
+    context = "(no source context required)" if conversation else _format_context(retrieval_result, max_chars)
+    support_criterion = (
+        "For this ordinary conversation, assess factual accuracy using general knowledge. No course-source citation is required."
+        if conversation else
+        "Every factual claim must be supported by the retrieved passages shown here. Mark false for unsupported claims, "
+        "contradictions, or invented facts; accurate general background alone cannot supply missing source evidence. "
+        "Source numbers refer only to these visible passages."
+    )
     prompt = _ANSWER_PROMPT.format(
-        question=question, context=context, answer=answer
+        question=question, context=context, answer=answer, support_criterion=support_criterion
     )
 
     try:

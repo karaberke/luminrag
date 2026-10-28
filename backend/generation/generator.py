@@ -17,8 +17,13 @@ import re
 from pydantic import BaseModel, Field
 
 from backend.llm import structured
-from backend.schemas import Chunk, CitationSpan, GenerationResult, ReflectionVerdict, RetrievalResult
+from backend.schemas import CitationSpan, GenerationResult, ReflectionVerdict, RetrievalResult
 from backend.self_rag.self_rag_reflector import reflect_answer
+from backend.utils.context import (
+    DEFAULT_GENERATION_CONTEXT_CHARS,
+    context_chunks as _context_chunks,
+    format_context as _format_chunks,
+)
 from backend.utils.text import find_quote_span
 from backend.generation.prompts import (
     DENSE_RAG_PROMPT,
@@ -56,55 +61,10 @@ If no passage supports a claim, say so. With no retrieved passages, citations is
 # Context formatters
 # ---------------------------------------------------------------------------
 
-_CONTEXT_SEPARATOR = "\n\n"
-_CONTEXT_TRUNCATION = "... (truncated — context limit reached)"
-
-
-def _context_chunks(result: RetrievalResult, max_chars: int) -> list[Chunk]:
-    """Keep bounded passage prefixes with offsets still relative to original text."""
-    max_chars = max(0, max_chars)
-    full_size = sum(len(f"[{index}] ({chunk.modality}) {chunk.text}")
-                    for index, chunk in enumerate(result.chunks, start=1))
-    full_size += len(_CONTEXT_SEPARATOR) * max(0, len(result.chunks) - 1)
-    # Reserve the notice before taking a prefix so the entire formatted context
-    # remains within its budget, including headers and passage separators.
-    budget = max_chars if full_size <= max_chars else max(0, max_chars - len(_CONTEXT_SEPARATOR) - len(_CONTEXT_TRUNCATION))
-    included: list[Chunk] = []
-    total = 0
-    for index, chunk in enumerate(result.chunks, start=1):
-        header = f"[{index}] ({chunk.modality}) "
-        separator_size = len(_CONTEXT_SEPARATOR) if included else 0
-        available = budget - total - separator_size - len(header)
-        if available <= 0:
-            break
-        if len(chunk.text) > available:
-            included.append(chunk.model_copy(update={"text": chunk.text[:available]}))
-            break
-        included.append(chunk)
-        total += separator_size + len(header) + len(chunk.text)
-    return included
-
-
-def _format_chunks(result: RetrievalResult, max_chars: int) -> str:
-    """
-    Format retrieved chunks as a numbered list, truncated to max_chars.
-    Returns a placeholder when no chunks are available.
-    """
-    if not result.chunks:
-        return "(no context retrieved)"
-
-    included = _context_chunks(result, max_chars)
-    lines = [f"[{index}] ({chunk.modality}) {chunk.text}" for index, chunk in enumerate(included, start=1)]
-    if len(included) < len(result.chunks) or any(chunk.text != original.text for chunk, original in zip(included, result.chunks)):
-        lines.append(_CONTEXT_TRUNCATION)
-
-    return _CONTEXT_SEPARATOR.join(lines)[:max(0, max_chars)]
-
-
-def _format_relationships(result: RetrievalResult) -> str:
+def _format_relationships(result: RetrievalResult, max_chars: int | None = None) -> str:
     """Keep hierarchy explicit; semantic connections carry no named predicate."""
     if not result.subgraph:
-        return "(no connections retrieved)"
+        return "(no connections retrieved)" if max_chars is None else "(no connections retrieved)"[:max(0, max_chars)]
     lines: list[str] = []
     seen: set[tuple[str, ...]] = set()
     for triple in result.subgraph:
@@ -118,7 +78,22 @@ def _format_relationships(result: RetrievalResult) -> str:
         if identity not in seen:
             lines.append(line)
             seen.add(identity)
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    notice = "... (connections truncated)"
+    budget = max(0, max_chars - len(notice) - 1)
+    included: list[str] = []
+    total = 0
+    for line in lines:
+        size = len(line) + bool(included)
+        if total + size > budget:
+            break
+        included.append(line)
+        total += size
+    if len(notice) <= max_chars:
+        included.append(notice)
+    return "\n".join(included)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +182,7 @@ def _build_prompt(
     context = _format_chunks(result, max_chars)
 
     if mode == "graph":
-        relationships = _format_relationships(result)
+        relationships = _format_relationships(result, max_chars)
         return GRAPH_RAG_PROMPT.format(
             question=question,
             context=context,
@@ -215,7 +190,7 @@ def _build_prompt(
         )
 
     if mode == "hybrid":
-        relationships = _format_relationships(result)
+        relationships = _format_relationships(result, max_chars)
         return HYBRID_RAG_PROMPT.format(
             question=question,
             context=context,
@@ -254,7 +229,7 @@ def generate(
         GenerationResult with answer, routing_mode, reflection, evidence_chunk_ids.
     """
     cfg = config.get("generator", {})
-    max_chars = cfg.get("max_context_chars", 4000)
+    max_chars = cfg.get("max_context_chars", DEFAULT_GENERATION_CONTEXT_CHARS)
 
     visible_result = retrieval_result.model_copy(update={
         "chunks": _context_chunks(retrieval_result, max_chars) if retrieval_result.routing_mode != "none" else [],

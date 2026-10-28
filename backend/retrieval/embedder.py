@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import threading
 import os
+from contextlib import contextmanager
 
 import numpy as np
 
-from backend.utils.resources import reserve_model_resource
+from backend.utils.resources import ModelResourcesBusy, model_resource_timeout
 from backend.utils.models import pinned_model_path
+
+EMBEDDING_BATCH_SIZE = 64
 
 
 class Embedder:
@@ -40,7 +43,34 @@ class Embedder:
                                     specific_model_path=str(pinned_model_path(model_name)))
         self._dimension = TextEmbedding.get_embedding_size(model_name)
         # ONNX/tokenizer inference is serialized independently of state locks.
-        self._inference_lock = threading.RLock()
+        self._inference_condition = threading.Condition()
+        self._inference_active = False
+        self._interactive_waiters = 0
+
+    @contextmanager
+    def _reserve_inference(self):
+        """Give queued interactive calls the next batch boundary, within a deadline."""
+        timeout = model_resource_timeout()
+        with self._inference_condition:
+            if timeout is None:
+                self._inference_condition.wait_for(lambda: not self._inference_active and not self._interactive_waiters)
+            else:
+                self._interactive_waiters += 1
+                self._inference_condition.notify_all()
+                try:
+                    available = self._inference_condition.wait_for(lambda: not self._inference_active, timeout=timeout)
+                finally:
+                    self._interactive_waiters -= 1
+                    self._inference_condition.notify_all()
+                if not available:
+                    raise ModelResourcesBusy()
+            self._inference_active = True
+        try:
+            yield
+        finally:
+            with self._inference_condition:
+                self._inference_active = False
+                self._inference_condition.notify_all()
 
     def embed(self, texts: list[str]) -> np.ndarray:
         """
@@ -54,9 +84,17 @@ class Embedder:
         """
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
-        with reserve_model_resource(self._inference_lock):
-            vecs = np.asarray(list(self._model.embed(texts)), dtype=np.float32)
-        return self._normalize(vecs)
+        # A large import must not reserve the shared tokenizer/model for its
+        # entire corpus. Release it between bounded native inference batches.
+        vectors = np.empty((len(texts), self.dimension), dtype=np.float32)
+        for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+            with self._reserve_inference():
+                result = np.asarray(list(self._model.embed(batch, batch_size=EMBEDDING_BATCH_SIZE)), dtype=np.float32)
+            if result.shape != (len(batch), self.dimension):
+                raise ValueError("Embedding model returned an unexpected number of vectors.")
+            vectors[start:start + len(batch)] = self._normalize(result)
+        return vectors
 
     def _normalize(self, vecs: np.ndarray) -> np.ndarray:
         if vecs.ndim != 2 or vecs.shape[1] != self.dimension or not np.isfinite(vecs).all():
@@ -66,7 +104,7 @@ class Embedder:
 
     def embed_query(self, text: str) -> np.ndarray:
         """Encode a query using BGE's retrieval prefix, not the passage API."""
-        with reserve_model_resource(self._inference_lock):
+        with self._reserve_inference():
             vecs = np.asarray(list(self._model.query_embed(text)), dtype=np.float32)
         return self._normalize(vecs)[0]
 

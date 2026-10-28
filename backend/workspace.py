@@ -28,9 +28,14 @@ from fastapi import HTTPException, Request
 
 from backend.db.document_store import DocumentStore
 from backend.graph.graph_builder import GraphBuilder
+from backend.graph.schema import (
+    EdgeInput, MAX_GRAPH_NAME, NODE_SCHEMA_VERSION, legacy_node_schema,
+    normalize_legacy_edge_attrs, normalize_legacy_node_attrs, validate_node_attrs,
+)
 from backend.retrieval.vector_retriever import VectorIndex
 from backend.schemas import Chunk, MAX_CHUNK_TEXT_CHARACTERS
 from backend.utils.associations import normalize_associations
+from backend.utils.environment import hosted_mode
 
 MAX_CHUNKS = 20_000
 MAX_NODES = 30_000
@@ -54,6 +59,12 @@ def validate_workspace_data(chunks: list[Chunk], graph: nx.MultiDiGraph) -> None
     """Keep each cache within the same bounds as its portable bundle."""
     if len(chunks) > MAX_CHUNKS or graph.number_of_nodes() > MAX_NODES or graph.number_of_edges() > MAX_EDGES:
         raise ValueError("Workspace size limit exceeded.")
+    for key, attrs in graph.nodes(data=True):
+        if not isinstance(key, str) or not key or len(key) > MAX_GRAPH_NAME:
+            raise ValueError("Invalid graph node identifier.")
+        validate_node_attrs(attrs)
+    for _, _, attrs in graph.edges(data=True):
+        EdgeInput.model_validate(attrs)
     normalize_associations(graph)
     chunk_ids = {chunk.id for chunk in chunks}
     for source, target, attrs in graph.edges(data=True):
@@ -77,10 +88,6 @@ def validate_workspace_data(chunks: list[Chunk], graph: nx.MultiDiGraph) -> None
     graph_bytes = len(json.dumps(nx.node_link_data(graph), allow_nan=False).encode("utf-8"))
     if graph_bytes > MAX_MEMBER_BYTES["graph.json"]:
         raise ValueError("Workspace graph content exceeds the size limit.")
-
-
-def hosted_mode() -> bool:
-    return os.getenv("LUMIN_HOSTED", "").strip() == "1"
 
 
 def max_workspace_bytes() -> int:
@@ -163,10 +170,11 @@ class Workspace:
 
 def copy_workspace_upload(source, destination: Path, limit: int) -> int:
     from backend.utils.uploads import copy_bounded, UploadRejected
+    from backend.utils.resources import reserve_model_resource
     ws = current_workspace.get()
     if ws is None:
         return copy_bounded(source, destination, limit)
-    with ws.mutation_lock:
+    with reserve_model_resource(ws.mutation_lock):
         remaining = max_workspace_bytes() - ws.disk_bytes()
         if remaining <= 0:
             raise UploadRejected("Workspace storage limit exceeded.", status=413)
@@ -337,11 +345,11 @@ def export_bundle(ws: Workspace) -> bytes:
     """Export only data formats, never pickle or SQLite database files."""
     buffer = io.BytesIO()
     chunks = ws.store.get_all_chunks()
-    normalize_associations(ws.graph_builder.graph)
+    validate_workspace_data(chunks, ws.graph_builder.graph)
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", json.dumps({"format": "lumin", "version": 1, "workspace_version": ws.version, "embedding_model": ws.embedder.model_name, "chunk_ids": [c.id for c in chunks]}))
         archive.writestr("chunks.jsonl", "\n".join(c.model_copy(update={"metadata": _portable_metadata(c.metadata, ws.processed_dir)}).model_dump_json() for c in chunks))
-        graph = {"association_version": 1, "nodes": [{"id": key, **attrs, "illustration_path": _portable_asset(attrs.get("illustration_path"), ws.processed_dir)} for key, attrs in ws.graph_builder.graph.nodes(data=True)], "edges": [{"source": u, "target": v, "key": k, **attrs} for u, v, k, attrs in ws.graph_builder.graph.edges(keys=True, data=True)]}
+        graph = {"association_version": 1, "node_schema_version": NODE_SCHEMA_VERSION, "nodes": [{"id": key, **attrs, "illustration_path": _portable_asset(attrs.get("illustration_path"), ws.processed_dir)} for key, attrs in ws.graph_builder.graph.nodes(data=True)], "edges": [{"source": u, "target": v, "key": k, **attrs} for u, v, k, attrs in ws.graph_builder.graph.edges(keys=True, data=True)]}
         archive.writestr("graph.json", json.dumps(graph))
         vectors = getattr(ws.vector_index, "embeddings", None)
         ids = list(getattr(ws.vector_index, "chunk_ids", []))
@@ -397,28 +405,37 @@ def read_bundle(data: bytes) -> tuple[dict, list[Chunk], nx.MultiDiGraph, dict[s
             raise ValueError("Invalid graph payload.")
         nodes = payload.get("nodes", [])
         edges = payload.get("edges", payload.get("links", []))
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise ValueError("Invalid graph payload.")
         if len(nodes) > MAX_NODES or len(edges) > MAX_EDGES:
             raise ValueError("Workspace graph limit exceeded.")
+        legacy = legacy_node_schema(payload.get("node_schema_version"))
         graph = nx.MultiDiGraph()
+        graph.graph["node_schema_version"] = NODE_SCHEMA_VERSION
         for raw in nodes:
             attrs = dict(raw)
             key = attrs.pop("id")
             if not isinstance(key, str) or not key or len(key) > 500 or key in graph or attrs.get("node_type") not in {"topic", "subtopic", "content", "note", "chunk_ref"}:
                 raise ValueError("Invalid graph node.")
-            if attrs.get("node_type") != "chunk_ref":
-                from backend.utils.graph_ops import NodeInput
-                validated = NodeInput.model_validate(attrs)
-                attrs.update(validated.model_dump(exclude_none=True))
+            if legacy:
+                attrs = normalize_legacy_node_attrs(attrs)
+            validated = validate_node_attrs(attrs)
+            attrs.update(validated.model_dump(exclude_none=True, exclude_unset=True))
             graph.add_node(key, **attrs)
         for raw in edges:
             attrs = dict(raw)
             source, target = attrs.pop("source"), attrs.pop("target")
             key = attrs.pop("key", None)
             attrs.pop("id", None)
-            if source not in graph or target not in graph or attrs.get("relation") not in {"HAS_SUBTOPIC", "HAS_CONTENT", "RELATED_TO", "EVIDENCE_OF"}:
+            if (not isinstance(source, str) or not isinstance(target, str)
+                    or not isinstance(key, (str, int, type(None)))
+                    or source not in graph or target not in graph
+                    or attrs.get("relation") not in {"HAS_SUBTOPIC", "HAS_CONTENT", "RELATED_TO", "EVIDENCE_OF"}):
                 raise ValueError("Invalid graph edge.")
-            from backend.utils.graph_ops import EdgeInput
-            EdgeInput.model_validate(attrs)
+            if legacy:
+                attrs = normalize_legacy_edge_attrs(attrs)
+            else:
+                EdgeInput.model_validate(attrs)
             graph.add_edge(source, target, key=key, **attrs)
         normalize_associations(graph)
         files = {name: archive.read(name) for name in names if name.startswith("assets/") and not name.endswith("/")}

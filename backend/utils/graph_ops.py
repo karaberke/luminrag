@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Literal
 from copy import deepcopy
 
 import networkx as nx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 
 from backend.graph.graph_builder import GraphBuilder
-from backend.graph.schema import ALL_RELATIONS, Illustration, NodeType, _now_iso, make_key
+from backend.graph.schema import ALL_RELATIONS, EdgeInput, NodeInput, _now_iso, make_key
 from backend.schemas import Chunk
 from backend.utils.budgets import JsonWorkBudget
 from backend.utils.associations import (
-    AssociationSupport, MAX_SUPPORTS, association_id, normalize_association_pair, remove_association_supports,
+    association_id, normalize_association_pair, remove_association_supports,
 )
 
 _WIKILINK = re.compile(r"\[\[([^\[\]\n]{1,500})\]\]")
@@ -25,35 +24,6 @@ MAX_INVERSE_BYTES = 16 * 1024 * 1024
 def inverse_budget() -> JsonWorkBudget:
     # The compatibility response exposes the inverse under three names.
     return JsonWorkBudget(MAX_INVERSE_ITEMS, MAX_INVERSE_BYTES, copies=3)
-
-
-class NodeInput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    name: str = Field(min_length=1, max_length=500)
-    node_type: NodeType = "note"
-    title: str = Field(default="", max_length=500)
-    body: str = Field(default="", max_length=100_000)
-    summary: str = Field(default="", max_length=100_000)
-    raw_excerpt: str = Field(default="", max_length=100_000)
-    key_terms: list[str] = Field(default_factory=list, max_length=200)
-    source_ids: list[str] = Field(default_factory=list, max_length=20_000)
-    parent_topic_keys: list[str] = Field(default_factory=list, max_length=200)
-    parent_subtopic_keys: list[str] = Field(default_factory=list, max_length=200)
-    scope: Literal["broad", "narrow"] = "broad"
-    content_type: Literal["definition", "theorem", "technique", "example", "question", "figure", "other"] = "other"
-    illustration: Illustration | None = None
-    illustration_path: str | None = Field(default=None, max_length=2048)
-    x: float | None = Field(default=None, allow_inf_nan=False)
-    y: float | None = Field(default=None, allow_inf_nan=False)
-
-
-class EdgeInput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    relation: Literal["HAS_SUBTOPIC", "HAS_CONTENT", "RELATED_TO", "EVIDENCE_OF"]
-    label: str | None = Field(default=None, max_length=200)
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
-    source_chunk_ids: list[str] = Field(default_factory=list, max_length=20_000)
-    supports: list[AssociationSupport] | None = Field(default=None, min_length=1, max_length=MAX_SUPPORTS)
 
 
 def note_chunk_id(key: str) -> str:
@@ -130,12 +100,64 @@ def _id(value) -> str:
     return value
 
 
+class _EdgeIdIndex:
+    """Request-local aliases; edge edits update only their affected pairs."""
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.aliases = {}
+        self.pairs = {}
+        for source, target, key, attrs in graph.edges(keys=True, data=True):
+            self._add(source, target, key, attrs)
+
+    def _add(self, source, target, key, attrs):
+        aliases = {f"{source}__{attrs.get('label') or attrs.get('relation')}__{target}"}
+        if isinstance(attrs.get("id"), str):
+            aliases.add(attrs["id"])
+        if attrs.get("relation") == "RELATED_TO":
+            aliases.add(association_id(source, target))
+        identity = (source, target, key)
+        self.pairs.setdefault((source, target), {})[key] = aliases
+        for alias in aliases:
+            self.aliases.setdefault(alias, {})[identity] = None
+
+    def find(self, edge_id):
+        if not isinstance(edge_id, str) or not edge_id:
+            return None
+        matches = self.aliases.get(edge_id)
+        if not matches:
+            return None
+        source, target, key = next(iter(matches))
+        return source, target, self.graph[source][target][key]
+
+    def refresh_pair(self, source, target):
+        for key, aliases in self.pairs.pop((source, target), {}).items():
+            for alias in aliases:
+                matches = self.aliases[alias]
+                del matches[(source, target, key)]
+                if not matches:
+                    del self.aliases[alias]
+        for key, attrs in (self.graph.get_edge_data(source, target) or {}).items():
+            self._add(source, target, key, attrs)
+
+
+def _edge_id_index(graph, budget):
+    # The API shares its inverse budget across one candidate's ordered batch.
+    index = getattr(budget, "_edge_id_index", None)
+    if index is None or index.graph is not graph:
+        index = budget._edge_id_index = _EdgeIdIndex(graph)
+    return index
+
+
 def apply_op(builder: GraphBuilder, operation: dict, budget: JsonWorkBudget | None = None) -> dict:
     """Apply one operation, returning an inverse containing only affected data."""
     graph = builder.graph
     if budget is None:
         budget = inverse_budget()
     kind = operation.get("op", operation.get("type"))
+    if kind in {"add_node", "update_node", "delete_node", "merge_nodes", "restore_nodes"}:
+        # These operations can alter hierarchy and wikilinks beyond one pair.
+        budget._edge_id_index = None
     if kind == "add_node":
         raw = dict(operation.get("node", operation.get("data", {})))
         raw["name"] = str(raw.get("name") or raw.get("title") or "New note").strip()
@@ -180,9 +202,7 @@ def apply_op(builder: GraphBuilder, operation: dict, budget: JsonWorkBudget | No
         source, target = raw.get("source"), raw.get("target")
         if kind == "delete_edge" and (not source or not target):
             edge_id = raw.get("id")
-            found = next(((u, v, attrs) for u, v, attrs in graph.edges(data=True) if attrs.get("id") == edge_id or
-                          (attrs.get("relation") == "RELATED_TO" and association_id(u, v) == edge_id) or
-                          f"{u}__{attrs.get('label') or attrs.get('relation')}__{v}" == edge_id), None)
+            found = _edge_id_index(graph, budget).find(edge_id)
             if found is None:
                 raise ValueError("Edge not found.")
             source, target, data = found
@@ -204,6 +224,10 @@ def apply_op(builder: GraphBuilder, operation: dict, budget: JsonWorkBudget | No
             builder.add_related_to(source, target, confidence=confidence, source_chunk_ids=raw.get("source_chunk_ids", []))
         else:
             builder.add_structural_edge(source, relation, target, raw.get("source_chunk_ids", []))
+        index = getattr(budget, "_edge_id_index", None)
+        if index is not None and index.graph is graph:
+            for left, right in {(source, target), (target, source)}:
+                index.refresh_pair(left, right)
         return inverse
     if kind == "merge_nodes":
         keep, drop = _id(operation.get("keep")), _id(operation.get("drop"))
@@ -252,6 +276,10 @@ def apply_op(builder: GraphBuilder, operation: dict, budget: JsonWorkBudget | No
             EdgeInput.model_validate(entry["attrs"])
             graph.add_edge(left, right, key=entry["key"], **deepcopy(entry["attrs"]))
         normalize_association_pair(graph, source, target)
+        index = getattr(budget, "_edge_id_index", None)
+        if index is not None and index.graph is graph:
+            for left, right in {(source, target), (target, source)}:
+                index.refresh_pair(left, right)
         return inverse
     if kind == "restore_nodes":
         ids = [_id(key) for key in operation.get("ids", [])]

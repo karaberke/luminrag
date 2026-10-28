@@ -23,6 +23,9 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Test / coverage
+backend/tests/
+frontend/tests/
+pytest.ini
 .tox/
 .coverage
 .cache
@@ -36,6 +39,7 @@ pip-delete-this-directory.txt
 # Keep only reviewed, empty templates; real environment files stay local.
 .env*
 !.env.example
+!.env.selfhost.example
 .envrc
 settings.local.json
 .aws/
@@ -148,6 +152,9 @@ backend/data/*
 *.local
 .tmp/
 *.lumin
+reports/
+research_notes/
+/PROJECT.md
 
 # --- Optional: large binary / cache ---
 *.zip

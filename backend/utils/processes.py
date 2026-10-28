@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import psutil
 
+from backend.utils.environment import hosted_mode
+
 MIB = 1024 * 1024
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAX_DOCUMENT_TEXT_BYTES = 8 * MIB
@@ -60,7 +62,7 @@ def _child_environment() -> dict[str, str]:
     env.update(PYTHONPATH=str(REPO_ROOT), PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1",
                OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
                NUMEXPR_NUM_THREADS="1", LUMINRAG_SKIP_DOTENV="1",
-               LUMIN_HOSTED="1" if os.getenv("LUMIN_HOSTED") == "1" else "0",
+               LUMIN_HOSTED="1" if hosted_mode() else "0",
                ORT_DISABLE_TELEMETRY="1",
                OPENCV_FFMPEG_CAPTURE_OPTIONS="protocol_whitelist;file")
     return env

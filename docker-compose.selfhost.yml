@@ -1,0 +1,61 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: ${LUMINRAG_SELFHOST_ENV_FILE:-.env.selfhost}
+    environment:
+      LUMINRAG_API_TOKEN: ${LUMINRAG_API_TOKEN:?Set LUMINRAG_API_TOKEN in .env before starting Docker}
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Only the root bootstrap repairs legacy volume ownership and uses gosu.
+    # The Python process runs as UID 1000 with no effective capabilities.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+      - /app/backend/data/staging:rw,nosuid,nodev,noexec,size=2g,uid=1000,gid=1000,mode=0700
+    volumes:
+      # Persist the SQLite DB, NumPy vectors and graph across restarts.
+      - luminrag_data:/app/backend/data/processed
+      # Source links must survive container replacement as well as the index.
+      - luminrag_raw:/app/backend/data/raw
+      # Mount config so you can tweak LLM settings without rebuilding
+      - ./config:/app/config:ro
+      # Optional Whisper/Hugging Face caches; verified retrieval weights are read-only.
+      - luminrag_cache:/var/cache/luminrag
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=2).close()"]
+      interval: 15s
+      timeout: 3s
+      start_period: 120s
+      retries: 3
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:80:8080"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+      - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,uid=101,gid=101,mode=0700
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  luminrag_data:
+  luminrag_raw:
+  luminrag_cache:

@@ -34,6 +34,8 @@ from urllib.parse import urlsplit
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from backend.utils.environment import hosted_mode
+
 TOKEN_ENV = "LUMINRAG_API_TOKEN"
 CORS_ORIGINS_ENV = "LUMINRAG_ALLOWED_ORIGINS"
 SESSION_COOKIE = "luminrag_session"
@@ -195,7 +197,7 @@ def evaluate_request(request: Request) -> AuthResult:
     # Only the outer workspace middleware can set this ASGI state marker.
     # It validates the capability and denies legacy file/S3/session routes
     # before handing a hosted request to this authentication layer.
-    if os.getenv("LUMIN_HOSTED") == "1" and getattr(request.state, "hosted_workspace_authorized", False):
+    if hosted_mode() and getattr(request.state, "hosted_workspace_authorized", False):
         return AuthResult(True, "workspace")
     token = get_api_token()
     if token:

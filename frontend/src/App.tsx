@@ -1,5 +1,6 @@
 import BrandMark from './components/BrandMark'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { liveQuery } from 'dexie'
 import type { EvidenceChunk, GraphData, GraphNode, Message, NodeType } from './types'
 const GraphPanel = lazy(() => import('./components/GraphPanel'))
 const SourceViewer = lazy(() => import('./components/source/SourceViewer'))
@@ -22,7 +23,7 @@ import {
 } from './utils/api'
 import { endSession, fetchAuthStatus, observeSessionStatus } from './utils/auth'
 import { applyNodeUpdates, evidenceForNode, highlightGraphTrace, type NodeEvidenceState } from './utils/graph'
-import { activeWorkspaceId, clearWorkspaceData, db, settleIngestOriginals } from './storage/db'
+import { activeWorkspaceId, clearWorkspaceData, db, pendingIngestJobs, preloadSources, settleIngestOriginals, withOriginalsLock } from './storage/db'
 import { restoreSelectedWorkspace, scheduleWorkspaceSave } from './utils/workspaces'
 import { finishOpenRouterConnection, getLlmSettings, loadLlmSettings } from './utils/settings'
 import { applyGraphOps, resetGraphHistory } from './components/graph/useGraphStore'
@@ -116,7 +117,24 @@ export default function App() {
   const { theme, toggleTheme } = useTheme()
   const isDark = theme === 'dark'
   const canConnect = authPhase === 'ready' && (!hosted || providerReady)
-  const isReady = canConnect && !workspaceLoading
+  const isReady = canConnect && !workspaceLoading && !clearing
+
+  const resumeIngestJobs = useCallback(async (ownerWorkspace: string, failure?: IngestJobState) => {
+    const pending = await pendingIngestJobs(ownerWorkspace)
+    const legacy = localStorage.getItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`)
+    const ids = legacy && !pending.includes(legacy) ? [...pending, legacy] : pending
+    if (activeWorkspaceId() !== ownerWorkspace) return
+    setIngestJob((current) => {
+      const next = current && !current.failed && ids.includes(current.id) ? current.id : ids[0]
+      return next ? current?.id === next && !current.failed ? current : { id: next, stage: 'Connecting…' } : failure ?? (current?.failed ? current : null)
+    })
+  }, [])
+
+  const finishIngestJob = useCallback(async (ownerWorkspace: string, jobId: string, failure?: IngestJobState) => {
+    const key = `${INGEST_JOB_KEY}:${ownerWorkspace}`
+    if (localStorage.getItem(key) === jobId) localStorage.removeItem(key)
+    await resumeIngestJobs(ownerWorkspace, failure)
+  }, [resumeIngestJobs])
 
   useEffect(() => {
     let disposed = false
@@ -153,12 +171,12 @@ export default function App() {
     suggestionsLoadRef.current = null
     cancelActiveQuery()
     setSuggestions([])
-    localStorage.removeItem(ingestJobKey())
     setIngestJob(null)
     setUploadOpen(false)
     setActiveSource(null)
     setEvidenceState(null)
     setEditMode(false)
+    setMessagesLoadedFor(null)
     setMessages([])
     setGraph(EMPTY_GRAPH)
     baseGraphRef.current = EMPTY_GRAPH
@@ -333,12 +351,11 @@ export default function App() {
       setMessages((saved?.messages ?? []).map((message) => ({ ...message, timestamp: new Date(message.timestamp) })))
       setMessagesLoadedFor(id)
       setWorkspaceLoading(false)
-      const savedJob = localStorage.getItem(ingestJobKey())
-      if (savedJob) setIngestJob({ id: savedJob, stage: 'Connecting…' })
+      await resumeIngestJobs(id)
       loadGraph(); loadSuggestions()
     }).catch((error) => { if (!cancelled) { setStorageError(errorMessage(error)); setIsGraphLoading(false); setWorkspaceLoading(false) } })
     return () => { cancelled = true }
-  }, [canConnect, workspaceId, hosted, loadGraph, loadSuggestions])
+  }, [canConnect, workspaceId, hosted, loadGraph, loadSuggestions, resumeIngestJobs])
 
   useEffect(() => {
     const changing = () => { cancelActiveQuery(); cancelGraphLoad(); setActiveSource(null); setWorkspaceLoading(true) }
@@ -371,6 +388,28 @@ export default function App() {
   // Background ingest-job polling — persisted via localStorage so it survives
   // tab closes and modal unmounts. Paused while access is not confirmed.
   // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!workspaceId || !isReady) return
+    const subscription = liveQuery(() => pendingIngestJobs(workspaceId)).subscribe({
+      next: () => { resumeIngestJobs(workspaceId).catch((error) => setStorageError(errorMessage(error))) },
+      error: (error) => setStorageError(errorMessage(error)),
+    })
+    return () => subscription.unsubscribe()
+  }, [workspaceId, isReady, resumeIngestJobs])
+
+  useEffect(() => {
+    if (!workspaceId) return
+    const subscription = liveQuery(() => db.rawFiles.where('workspaceId').equals(workspaceId).toArray()).subscribe({
+      next: () => {
+        preloadSources(workspaceId).then(() => {
+          if (activeWorkspaceId() === workspaceId) window.dispatchEvent(new Event('lumin-assets-updated'))
+        }).catch((error) => setStorageError(errorMessage(error)))
+      },
+      error: (error) => setStorageError(errorMessage(error)),
+    })
+    return () => subscription.unsubscribe()
+  }, [workspaceId])
+
   const pollingJobId = ingestJob && !ingestJob.failed ? ingestJob.id : null
 
   useEffect(() => {
@@ -389,10 +428,9 @@ export default function App() {
         if (res.status === 404) {
           // A missing job has no reliable completion outcome; keep committed originals.
           const originals = await settleIngestOriginals(pollingJobId, null, pollingWorkspaceId)
-          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
+          if (activeWorkspaceId() !== pollingWorkspaceId) return
           if (originals === 'discarded') setStorageError('This upload\'s final status is unavailable. Saved originals were not replaced. Re-upload the files to finish processing and refresh their previews.')
-          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
-          setIngestJob(null)
+          await finishIngestJob(pollingWorkspaceId, pollingJobId)
           return
         }
         if (!res.ok) throw new ApiError(res.status, res.statusText)
@@ -401,20 +439,19 @@ export default function App() {
         if (job.status === 'done') {
           const committedSources = job.result?.ingested_source_ids
           const originals = await settleIngestOriginals(pollingJobId, committedSources, pollingWorkspaceId)
-          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
+          if (activeWorkspaceId() !== pollingWorkspaceId) return
           if (originals === 'discarded' && !Array.isArray(committedSources)) setStorageError('This server did not confirm which files were processed. Saved originals were not replaced. Update the server and re-upload the files to refresh their previews.')
+          else if (originals === 'ambiguous') setStorageError('Overlapping uploads could not be matched to an exact original revision. Saved originals were kept. Re-upload those files one batch at a time to refresh their previews.')
           else if (job.result?.failed?.length) setStorageError(`Some files could not be processed: ${job.result.failed.join(', ')}. Their saved originals were kept. Re-upload those files to try again.`)
-          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
-          setIngestJob(null)
+          await finishIngestJob(pollingWorkspaceId, pollingJobId)
           loadGraph()
           loadSuggestions()
           scheduleWorkspaceSave()
         } else if (job.status === 'failed' || job.status === 'cancelled') {
           await settleIngestOriginals(pollingJobId, null, pollingWorkspaceId)
-          if (controller.signal.aborted || activeWorkspaceId() !== pollingWorkspaceId) return
-          localStorage.removeItem(`${INGEST_JOB_KEY}:${pollingWorkspaceId}`)
+          if (activeWorkspaceId() !== pollingWorkspaceId) return
           const reason = job.status === 'cancelled' ? 'Ingestion cancelled because the data was cleared.' : `Failed: ${job.error ?? 'unknown error'}`
-          setIngestJob({ id: pollingJobId, stage: reason, failed: true })
+          await finishIngestJob(pollingWorkspaceId, pollingJobId, { id: pollingJobId, stage: reason, failed: true })
         } else {
           setIngestJob({ id: pollingJobId, stage: job.progress_stage || 'Processing…' })
           timer = setTimeout(poll, 3000)
@@ -433,7 +470,7 @@ export default function App() {
       controller.abort()
       clearTimeout(timer)
     }
-  }, [pollingJobId, isReady, workspaceId, loadGraph, loadSuggestions])
+  }, [pollingJobId, isReady, workspaceId, loadGraph, loadSuggestions, finishIngestJob])
 
   // Hide a failed-job notice after a few seconds
   const ingestFailed = ingestJob?.failed ?? false
@@ -446,8 +483,8 @@ export default function App() {
   // Multi-tab sync: if another tab finishes/clears the job, stop polling here too
   useEffect(() => {
     const handler = (e: StorageEvent) => {
-      if (e.key === ingestJobKey() && e.newValue === null) {
-        setIngestJob(null)
+      if (e.key === ingestJobKey()) {
+        resumeIngestJobs(activeWorkspaceId()).catch((error) => setStorageError(errorMessage(error)))
         if (isReady) {
           loadGraph()
           loadSuggestions()
@@ -456,7 +493,7 @@ export default function App() {
     }
     window.addEventListener('storage', handler)
     return () => window.removeEventListener('storage', handler)
-  }, [isReady, loadGraph, loadSuggestions])
+  }, [isReady, loadGraph, loadSuggestions, resumeIngestJobs])
 
   const handleJobStarted = useCallback((jobId: string, ownerWorkspace = activeWorkspaceId()) => {
     localStorage.setItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`, jobId)
@@ -563,9 +600,11 @@ export default function App() {
     setClearDataOpen(false)
     setClearing(true)
     try {
-      await apiRequest('/api/data', { method: 'DELETE', workspaceId: ownerWorkspace })
-      await clearWorkspaceData(ownerWorkspace)
-      localStorage.removeItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`)
+      await withOriginalsLock(ownerWorkspace, async () => {
+        await apiRequest('/api/data', { method: 'DELETE', workspaceId: ownerWorkspace })
+        await clearWorkspaceData(ownerWorkspace)
+        localStorage.removeItem(`${INGEST_JOB_KEY}:${ownerWorkspace}`)
+      })
       if (activeWorkspaceId() !== ownerWorkspace) return
       resetGraphHistory()
       resetLoadedData()
@@ -592,16 +631,19 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const handleAddNode = async (payload: AddNodePayload) => {
+    if (!isReady) return
     try { await applyGraphOps([{ op: 'add_node', node: { ...payload, id: crypto.randomUUID() } }]) }
     catch (error) { setStorageError(errorMessage(error)) }
   }
 
   const handleDeleteNode = async (id: string) => {
+    if (!isReady) return
     try { await applyGraphOps([{ op: 'delete_node', id }]); setSelectedNodeId(null) }
     catch (error) { setStorageError(errorMessage(error)) }
   }
 
   const handleUpdateNode = async (id: string, updates: Record<string, unknown>) => {
+    if (!isReady) return
     await applyGraphOps([{ op: 'update_node', id, updates }])
     baseGraphRef.current = applyNodeUpdates(baseGraphRef.current, id, updates)
     setGraph((previous) => applyNodeUpdates(previous, id, updates))
@@ -609,11 +651,13 @@ export default function App() {
   }
 
   const handleConnectNodes = async (source: string, target: string, relation: string) => {
+    if (!isReady) return
     try { await applyGraphOps([{ op: 'add_edge', edge: { source, target, relation } }]) }
     catch (error) { setStorageError(errorMessage(error)) }
   }
 
   const handleDeleteEdge = async (source: string, relation: string, target: string) => {
+    if (!isReady) return
     try { await applyGraphOps([{ op: 'delete_edge', source, relation, target }]) }
     catch (error) { setStorageError(errorMessage(error)) }
   }
@@ -682,7 +726,7 @@ export default function App() {
               evidence={selectedNodeEvidence}
               evidenceLoading={selectedNodeLoading}
               onClose={() => setSelectedNodeId(null)}
-              editMode={editMode}
+              editMode={editMode && isReady}
               onDeleteNode={handleDeleteNode}
               onDeleteEdge={handleDeleteEdge}
               onUpdateNode={handleUpdateNode}
@@ -804,6 +848,7 @@ export default function App() {
             </button>
             <button
               onClick={() => setUploadOpen(true)}
+              disabled={!isReady}
               className={`text-xs border px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1.5 ${
                 isDark
                   ? 'text-slate-400 hover:text-slate-200 border-slate-700 hover:border-indigo-600'

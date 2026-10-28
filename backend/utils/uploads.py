@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable
 
+from backend.utils.environment import hosted_mode
+
 MAX_UPLOAD_BYTES_ENV = "LUMINRAG_MAX_UPLOAD_BYTES"
 DEFAULT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_BATCH_FILES = 20
@@ -82,7 +84,7 @@ class UploadRejected(ValueError):
 
 
 def max_upload_bytes() -> int:
-    hosted = os.getenv("LUMIN_HOSTED") == "1"
+    hosted = hosted_mode()
     default = 50 * 1024 * 1024 if hosted else DEFAULT_MAX_UPLOAD_BYTES
     raw = os.getenv(MAX_UPLOAD_BYTES_ENV, "").strip()
     if not raw:
@@ -131,7 +133,7 @@ def validate_file(filename: str | None, content_type: str | None) -> str:
     """
     safe = sanitize_filename(filename)
     ext = file_extension(safe)
-    if os.getenv("LUMIN_HOSTED") == "1" and ext in VIDEO_EXT | AUDIO_EXT:
+    if hosted_mode() and ext in VIDEO_EXT | AUDIO_EXT:
         raise UploadRejected("Video and audio are available only when self hosted.", status=415)
     if ext not in SUPPORTED_EXT:
         raise UploadRejected(
@@ -422,7 +424,7 @@ class UploadBodyLimitMiddleware:
             from starlette.responses import JSONResponse
 
             cap = MAX_BATCH_FILES * max_upload_bytes() + _MULTIPART_OVERHEAD_BYTES
-            if os.getenv("LUMIN_HOSTED") == "1":
+            if hosted_mode():
                 cap = min(cap, 100 * 1024 * 1024 + _MULTIPART_OVERHEAD_BYTES)
             raw = dict(scope.get("headers") or []).get(b"content-length")
             status, detail = None, None

@@ -58,3 +58,6 @@ backend/tests/
 **/service_account*.json
 .ssh/
 docs/
+reports/
+research_notes/
+pytest.ini

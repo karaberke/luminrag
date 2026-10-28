@@ -58,9 +58,9 @@ For a persistent self-hosted server, omit LUMIN_HOSTED. Local loopback access is
 ### Self-hosted Docker with audio/video
 
 ```powershell
-# Copy .env.example to .env only when .env does not already exist.
-# Set a long random LUMINRAG_API_TOKEN before starting Compose.
-docker compose up --build
+# Copy .env.selfhost.example to .env.selfhost if that file does not exist.
+# Set a long random LUMINRAG_API_TOKEN in .env.selfhost.
+docker compose --env-file .env.selfhost -f docker-compose.selfhost.yml up --build
 ```
 
 The frontend is at http://localhost and the backend port binds to loopback. The self-hosted Dockerfile installs the hashed `requirements.lock` plus ffmpeg. Optional NER is in `requirements-ner.lock`. The public image excludes torch, FAISS, Whisper, OpenCV, scikit-image, matplotlib, GLiNER, spaCy and AWS libraries.

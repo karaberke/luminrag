@@ -67,20 +67,20 @@ def _degraded(
     max_sources: int | None,
 ) -> list[Chunk]:
     """
-    Fallback when the cross-encoder is unavailable: keep retrieval order and
-    still enforce max_sources. No relevancy scores exist, so the cutoff is
-    skipped (and reported as such) rather than silently claimed.
+    Without scores, a positive cutoff fails closed. When no cutoff was
+    requested, preserve retrieval order and still enforce max_sources.
     """
+    if min_relevancy > 0.0:
+        logger.error(
+            "Cross-encoder failed (%s); returning no passages because min_relevancy=%.2f cannot be verified without scores.",
+            type(exc).__name__, min_relevancy,
+        )
+        return []
     capped = _cap(chunks, max_sources)
-    cutoff_note = (
-        f"min_relevancy={min_relevancy:.2f} cutoff NOT applied (no scores)"
-        if min_relevancy > 0.0
-        else "no relevancy cutoff requested"
-    )
     logger.error(
         f"Cross-encoder failed ({exc}); degraded mode: returning {len(capped)}/"
         f"{len(chunks)} chunks in retrieval order, max_sources={max_sources}, "
-        f"{cutoff_note}."
+        "no relevancy cutoff requested."
     )
     return capped
 
@@ -106,8 +106,9 @@ def rerank(
     Returns:
         Filtered, sorted list of Chunk objects.  Each chunk has
         ``metadata["relevancy_score"]`` set to sigmoid(logit) in (0, 1).
-        Returns an empty list when all chunks fall below min_relevancy
-        (the generator falls back to the NO_RETRIEVAL prompt path).
+        Returns an empty list when all chunks fall below min_relevancy,
+        or when a positive cutoff cannot be checked after model failure.
+        The generator then reports that no supporting passage was found.
     """
     if not chunks:
         return chunks

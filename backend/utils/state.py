@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
 
-from backend.utils.resources import nonblocking_model_resources
+from backend.utils.resources import nonblocking_model_resources, reserve_model_resource
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
@@ -46,7 +46,10 @@ def run_locked(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     from backend.workspace import current_workspace
     workspace = current_workspace.get()
     mutation_lock = workspace.mutation_lock if workspace is not None else MUTATION_LOCK
-    with mutation_lock, nonblocking_model_resources():
+    # Hosted requests inherit nonblocking resource admission from middleware.
+    # Background publication still waits, while requests cannot occupy the
+    # worker pool waiting behind a long operation in one knowledge base.
+    with reserve_model_resource(mutation_lock), nonblocking_model_resources():
         return fn(*args, **kwargs)
 
 
