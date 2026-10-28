@@ -1,6 +1,34 @@
 """Shared linear text splitting with exact PDF character/page provenance."""
 from bisect import bisect_left, bisect_right
 
+from backend.schemas import Chunk
+
+
+def graph_passage_batches(chunks: list[Chunk], *, max_chars: int = 6000, max_passages: int = 8) -> list[list[Chunk]]:
+    """Group bounded same-source views; original retrieval chunks stay untouched."""
+    max_chars = min(12000, max(2000, int(max_chars)))
+    max_passages = min(8, max(1, int(max_passages)))
+    batches: list[list[Chunk]] = []
+    current: list[Chunk] = []
+    size = 0
+    for chunk in chunks:
+        # Long custom retrieval chunks receive multiple graph views with the
+        # same original ID, so no tail is silently omitted from extraction.
+        views = [chunk] if len(chunk.text) <= max_chars else [
+            chunk.model_copy(update={"text": chunk.text[offset:offset + max_chars]})
+            for offset in range(0, len(chunk.text), max_chars)
+        ]
+        for view in views:
+            if current and (current[0].source_id != view.source_id or len(current) >= max_passages
+                            or size + len(view.text) > max_chars or any(item.id == view.id for item in current)):
+                batches.append(current)
+                current, size = [], 0
+            current.append(view)
+            size += len(view.text)
+    if current:
+        batches.append(current)
+    return batches
+
 def _hard_split(text: str, max_chars: int) -> list[str]:
     """
     Last-resort split for a single paragraph that exceeds max_chars.

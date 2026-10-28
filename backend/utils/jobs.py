@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import threading
+import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from collections.abc import Collection, MutableMapping
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 MAX_ACTIVE_JOBS = 8
 MAX_COMPLETED_JOBS = 128
@@ -12,6 +15,43 @@ MAX_RETAINED_ITEMS = 128
 TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
 REGISTRY_LOCK = threading.RLock()
 T = TypeVar("T")
+R = TypeVar("R")
+
+
+def ingestion_workers(config: dict) -> int:
+    """Bound provider I/O fan-out independently of native model CPU threads."""
+    maximum = min(8, max(1, int(os.getenv("LUMINRAG_INGEST_LLM_WORKERS", "4"))))
+    return min(maximum, max(1, int(config.get("max_workers", maximum))))
+
+
+def map_bounded(
+    function: Callable[[T], R], items: list[T], *, max_workers: int,
+    on_completed: Callable[[int, int], None] | None = None,
+) -> list[R]:
+    """Run bounded I/O tasks, retaining input order and request context.
+
+    Only one task per worker is submitted at a time. Graph mutations and
+    publication remain on the caller after all independent results finish.
+    """
+    if not items:
+        return []
+    workers = min(len(items), max(1, max_workers))
+    results: dict[int, R] = {}
+    pending = {}
+    next_index = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ingest") as executor:
+        while next_index < len(items) or pending:
+            while next_index < len(items) and len(pending) < workers:
+                context = copy_context()
+                future = executor.submit(context.run, function, items[next_index])
+                pending[future] = next_index
+                next_index += 1
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                results[pending.pop(future)] = future.result()
+                if on_completed:
+                    on_completed(len(results), len(items))
+    return [results[index] for index in range(len(items))]
 
 
 class JobCapacityError(RuntimeError):

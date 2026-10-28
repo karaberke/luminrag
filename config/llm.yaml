@@ -110,6 +110,13 @@ entity_extractor:
 # Stage-1 hierarchical graph extractors
 # ----------------------------------------------------------------------
 
+graph_extraction:
+  mode: combined                  # combined batches; separate retains legacy per-passage stages
+  max_batch_passages: 8            # original citation passages are never merged
+  max_batch_chars: 6000            # same-source extraction context, not retrieval chunk size
+  max_tokens: 8192                 # bounded combined hierarchy + concept-card output
+  max_workers: 4                   # provider I/O, bounded by LUMINRAG_INGEST_LLM_WORKERS
+
 topic_extractor:
   provider: ollama                # ollama | anthropic
   ollama_model: qwen2.5:7b

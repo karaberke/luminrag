@@ -16,12 +16,12 @@ Public API:
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import BaseModel, Field
 
-from backend.graph._llm import resolve_synonym, safe_call_json
+from backend.graph._llm import SynonymResolver, safe_call_json
+from backend.utils.jobs import ingestion_workers, map_bounded
 from backend.graph.schema import SubtopicProposal, make_key
 from backend.schemas import Chunk
 
@@ -88,6 +88,7 @@ def _extract_for_chunk(
     embedder: "Embedder | None",
     threshold: float,
     max_per_chunk: int,
+    resolver: SynonymResolver,
 ) -> list[SubtopicProposal]:
     if not chunk.text.strip():
         return []
@@ -98,6 +99,14 @@ def _extract_for_chunk(
         max_per_chunk=max_per_chunk,
     )
     raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 600), response_model=_SubtopicItems)
+    return subtopic_proposals_from_entries(raw, chunk, topic_names, max_per_chunk, resolver)
+
+
+def subtopic_proposals_from_entries(
+    raw: list[dict], chunk: Chunk, topic_names: list[str], max_per_chunk: int,
+    resolver: SynonymResolver,
+) -> list[SubtopicProposal]:
+    """Shared parsing and exact chunk attribution for separate/combined extraction."""
     proposals: list[SubtopicProposal] = []
     for entry in raw[:max_per_chunk]:
         try:
@@ -111,7 +120,6 @@ def _extract_for_chunk(
             logger.debug(f"Skipping malformed subtopic entry: {entry}")
             continue
 
-        name = resolve_synonym(name, existing_names, embedder, threshold)
         proposals.append(
             SubtopicProposal(
                 name=name,
@@ -121,6 +129,8 @@ def _extract_for_chunk(
                 source_chunk_ids=[chunk.id],
             )
         )
+    for proposal, name in zip(proposals, resolver.resolve_many([proposal.name for proposal in proposals])):
+        proposal.name = name
     return proposals
 
 
@@ -130,6 +140,8 @@ def extract_subtopics(
     config: dict,
     existing_names: list[str] | None = None,
     embedder: "Embedder | None" = None,
+    *,
+    on_completed: Callable[[int, int], None] | None = None,
 ) -> list[SubtopicProposal]:
     """
     Run Stage 1.3 across a batch of chunks for one document.
@@ -149,23 +161,22 @@ def extract_subtopics(
     cfg = config.get("subtopic_extractor", {})
     threshold = float(cfg.get("merge_threshold", 0.82))
     max_per_chunk = int(cfg.get("max_per_chunk", 3))
-    max_workers = int(cfg.get("max_workers", 4))
+    max_workers = ingestion_workers(cfg)
 
     _existing = existing_names or []
-    all_proposals: list[SubtopicProposal] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _extract_for_chunk,
-                chunk, topic_names, cfg, _existing, embedder, threshold, max_per_chunk,
-            ): chunk
-            for chunk in chunks
-        }
-        for future in as_completed(futures):
-            try:
-                all_proposals.extend(future.result())
-            except Exception as exc:
-                logger.warning(f"Subtopic extraction failed for chunk: {exc}")
+    resolver = SynonymResolver(_existing, embedder, threshold)
+
+    def extract(chunk: Chunk) -> list[SubtopicProposal]:
+        try:
+            return _extract_for_chunk(chunk, topic_names, cfg, _existing, embedder,
+                                      threshold, max_per_chunk, resolver)
+        except Exception as exc:
+            logger.warning("Subtopic extraction failed (%s)", type(exc).__name__)
+            return []
+
+    all_proposals = [proposal for batch in map_bounded(
+        extract, chunks, max_workers=max_workers, on_completed=on_completed,
+    ) for proposal in batch]
 
     # Deduplicate by resolved name — merge source_chunk_ids, keep longest summary
     merged: dict[str, SubtopicProposal] = {}

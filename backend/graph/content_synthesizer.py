@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
-from backend.graph._llm import resolve_synonym, safe_call_json
+from backend.graph._llm import SynonymResolver, safe_call_json
 from backend.graph.schema import ContentProposal, ContentType, Illustration, MAX_ILLUSTRATION_HINT
 from backend.schemas import Chunk
 
@@ -144,6 +144,8 @@ def synthesize_contents(
     config: dict,
     existing_titles: list[str] | None = None,
     embedder: "Embedder | None" = None,
+    *,
+    synonym_resolver: SynonymResolver | None = None,
 ) -> list[ContentProposal]:
     """
     Run Stage 1.4 over one chunk.
@@ -178,6 +180,15 @@ def synthesize_contents(
         max_per_chunk=max_per_chunk,
     )
     raw = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2000), response_model=_ContentItems)
+    resolver = synonym_resolver or SynonymResolver(existing_titles or [], embedder, threshold)
+    return content_proposals_from_entries(raw, chunk, subtopic_names, topic_names, max_per_chunk, resolver)
+
+
+def content_proposals_from_entries(
+    raw: list[dict], chunk: Chunk, subtopic_names: list[str], topic_names: list[str],
+    max_per_chunk: int, resolver: SynonymResolver,
+) -> list[ContentProposal]:
+    """Shared validated concept parsing for separate/combined extraction."""
 
     proposals: list[ContentProposal] = []
     for entry in raw[:max_per_chunk]:
@@ -198,8 +209,6 @@ def synthesize_contents(
             logger.debug(f"Skipping malformed content entry: {entry}")
             continue
 
-        title = resolve_synonym(title, existing_titles or [], embedder, threshold)
-
         proposals.append(
             ContentProposal(
                 title=title,
@@ -214,5 +223,7 @@ def synthesize_contents(
             )
         )
 
+    for proposal, title in zip(proposals, resolver.resolve_many([proposal.title for proposal in proposals])):
+        proposal.title = title
     logger.debug(f"[{chunk.id}] synthesized {len(proposals)} content unit(s)")
     return proposals

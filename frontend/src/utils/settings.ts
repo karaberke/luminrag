@@ -1,17 +1,18 @@
 import { db, initializeStorage } from '../storage/db'
 
-export type LlmProvider = 'openrouter' | 'anthropic' | 'ollama'
+export type LlmProvider = 'openrouter' | 'anthropic' | 'openai' | 'ollama'
 export interface LlmSettings { provider: LlmProvider; key: string; fastModel: string; smartModel: string }
 export const MODEL_DEFAULTS = {
   openrouter: { fastModel: 'anthropic/claude-haiku-4.5', smartModel: 'anthropic/claude-sonnet-4.6' },
   anthropic: { fastModel: 'claude-haiku-4-5', smartModel: 'claude-sonnet-4-6' },
+  openai: { fastModel: 'gpt-5.4-mini', smartModel: 'gpt-5.4' },
   ollama: { fastModel: 'llama3.2', smartModel: 'llama3.2' },
 }
 let current: LlmSettings = { provider: 'openrouter', key: '', ...MODEL_DEFAULTS.openrouter }
 let loaded: Promise<void> | undefined
 function modelPreferences(value: unknown): Omit<LlmSettings, 'key'> {
   const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {}
-  const provider = saved.provider === 'anthropic' || saved.provider === 'ollama' ? saved.provider : 'openrouter'
+  const provider = saved.provider === 'anthropic' || saved.provider === 'openai' || saved.provider === 'ollama' ? saved.provider : 'openrouter'
   const defaults = MODEL_DEFAULTS[provider]
   return {
     provider,

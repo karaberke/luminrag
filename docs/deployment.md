@@ -24,7 +24,7 @@ In that tunnel add a published application route:
 | --- | --- |
 | Hostname | `luminrag.karaberke.com` (or your chosen hostname) |
 | Service type | HTTP |
-| Service URL | `127.0.0.1:8080` |
+| Service URL | `http://127.0.0.1:8080` (include the protocol in a single URL field) |
 | HTTP Host Header | Leave unset |
 
 The website, backend and connector share an isolated network namespace. The
@@ -58,7 +58,7 @@ sudo docker compose up -d --build --wait --wait-timeout 300
 sudo docker compose ps
 ```
 
-Open your HTTPS hostname and connect Anthropic or OpenRouter in **AI settings**.
+Open your HTTPS hostname and connect OpenAI, Anthropic or OpenRouter in **AI settings**.
 Each visitor supplies their own provider key; no shared AI key belongs in the
 server `.env`. Provider keys are held in the current tab's memory and temporarily
 in server memory during processing; they are never written to browser storage,
@@ -148,7 +148,9 @@ and [Developer Program details](https://developer.apple.com/programs/whats-inclu
 
 Visitors can create an [OpenRouter account](https://openrouter.ai/) and use
 **Connect OpenRouter**, or obtain an Anthropic key through the
-[Anthropic Console](https://console.anthropic.com/). OpenRouter uses the
+[Anthropic Console](https://console.anthropic.com/) or an OpenAI key through
+[OpenAI Platform](https://platform.openai.com/api-keys). OpenAI API usage is billed
+separately from ChatGPT subscriptions. OpenRouter uses the
 [PKCE authorization flow](https://openrouter.ai/docs/guides/overview/auth/oauth)
 already implemented in LuminRAG; no shared developer client secret is needed.
 Provider keys remain in memory during use and are not saved by LuminRAG.

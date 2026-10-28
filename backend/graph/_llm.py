@@ -30,6 +30,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class SynonymResolver:
+    """One immutable name-vector pool per extraction stage, never per user cache."""
+
+    def __init__(self, existing: list[str], embedder: "Embedder | None", threshold: float):
+        self.existing = list(existing)
+        self.embedder = embedder
+        self.threshold = threshold
+        self.vectors = None
+        if self.existing and embedder is not None:
+            try:
+                self.vectors = embedder.embed(self.existing)
+            except Exception as exc:
+                logger.debug("Synonym pool embedding failed (%s)", type(exc).__name__)
+
+    def resolve_many(self, proposed: list[str]) -> list[str]:
+        if not proposed or self.vectors is None:
+            return proposed
+        try:
+            candidates = self.embedder.embed(proposed)
+            similarities = candidates @ self.vectors.T
+            best = similarities.argmax(axis=1)
+            return [self.existing[index] if float(similarities[row, index]) >= self.threshold else name
+                    for row, (name, index) in enumerate(zip(proposed, best))]
+        except Exception as exc:
+            logger.debug("Synonym matching failed (%s)", type(exc).__name__)
+            return proposed
+
+
 def call_llm(prompt: str, cfg: dict, *, max_tokens: int | None = None,
              response_model: type[BaseModel] | None = None) -> str:
     """Compatibility re-export for integrations from earlier self-host releases."""

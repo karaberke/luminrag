@@ -97,6 +97,7 @@ export interface EvidenceChunk {
 }
 
 export interface ReflectionVerdict {
+  verification_status?: 'verified' | 'skipped' | 'unavailable'
   needs_retrieval: boolean
   is_relevant: boolean
   is_supported: boolean

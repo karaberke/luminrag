@@ -32,6 +32,7 @@ from backend.generation.prompts import (
     NO_EVIDENCE_ANSWER,
     NO_RETRIEVAL_PROMPT,
     SYSTEM_PROMPT,
+    UNSUPPORTED_ANSWER,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,13 @@ class _AnswerCitation(BaseModel):
 
 
 class _AnswerOutput(BaseModel):
-    answer: str = Field(min_length=1, description="The complete Markdown answer, preserving numbered citations [N].")
     citations: list[_AnswerCitation] = Field(default_factory=list, max_length=32)
+    answer: str = Field(min_length=1, description="The complete Markdown answer, preserving numbered citations [N].")
 
 
 _CITATION_INSTRUCTIONS = """\
 Return the answer and its source quotes together in the required JSON object.
+Select supporting quotes first, then write only the answer those quotes support.
 The answer field contains the complete Markdown answer with [N] source references.
 For each source referenced in the answer, include one citations entry with its
 source_number N and a short exact supporting sentence copied from passage [N].
@@ -114,7 +116,9 @@ def _call_llm(prompt: str, system: str, cfg: dict) -> _AnswerOutput:
         return _call_ollama(prompt, system, cfg)
     if provider == "anthropic":
         return _call_anthropic(prompt, system, cfg)
-    return structured(prompt, {"structured_mode": "md_json", **cfg}, _AnswerOutput, system=system)
+    if provider == "openrouter":
+        cfg = {"structured_mode": "md_json", **cfg}
+    return structured(prompt, cfg, _AnswerOutput, system=system)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +248,7 @@ def generate(
             reflection=ReflectionVerdict(
                 needs_retrieval=True, is_relevant=False, is_supported=False,
                 is_useful=False, reasoning="No supporting source passage was available for a grounded answer.",
+                verification_status="skipped",
             ),
             evidence_chunk_ids=[], citations=[],
         )
@@ -266,12 +271,20 @@ def generate(
     if failed:
         # Reflecting on a provider-error placeholder wastes another paid call.
         reflection = ReflectionVerdict(needs_retrieval=bool(retrieval_result.chunks), is_relevant=True,
-                                       is_supported=False, is_useful=False, reasoning="Answer generation was unavailable.")
+                                       is_supported=False, is_useful=False, reasoning="Answer generation was unavailable.",
+                                       verification_status="unavailable")
     elif config.get("query_mode") == "fast":
-        reflection = ReflectionVerdict(needs_retrieval=bool(retrieval_result.chunks), is_relevant=True,
-                                       is_supported=True, is_useful=True, reasoning="Fast mode: reflection skipped.")
+        reflection = ReflectionVerdict(needs_retrieval=bool(retrieval_result.chunks), is_relevant=False,
+                                       is_supported=False, is_useful=False, reasoning="Fast mode: answer verification was not run.",
+                                       verification_status="skipped")
     else:
         reflection = reflect_answer(question, retrieval_result, answer, config)
+        if (retrieval_result.routing_mode != "none" and reflection.verification_status == "verified"
+                and not reflection.is_supported):
+            # A failed source check must not leave the known unsupported claim
+            # as the answer. Keep the retrieved passages available to inspect.
+            answer = UNSUPPORTED_ANSWER
+            citations = []
     evidence_chunk_ids = _extract_cited_chunk_ids(answer, visible_result)
 
     logger.debug(

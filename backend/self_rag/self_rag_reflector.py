@@ -45,6 +45,7 @@ _SAFE_DEFAULT = ReflectionVerdict(
     is_supported=True,
     is_useful=True,
     reasoning="Reflection unavailable — defaulting to pass-through.",
+    verification_status="unavailable",
 )
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ def reflect_retrieval(
         verdict = _parse_verdict(raw)
         logger.debug(
             f"Retrieval reflection — relevant={verdict.is_relevant} "
-            f"needs_retrieval={verdict.needs_retrieval} | {verdict.reasoning}"
+            f"needs_retrieval={verdict.needs_retrieval}"
         )
         return verdict
     except Exception as exc:
@@ -227,6 +228,10 @@ def reflect_answer(
         if conversation else
         "Every factual claim must be supported by the retrieved passages shown here. Mark false for unsupported claims, "
         "contradictions, or invented facts; accurate general background alone cannot supply missing source evidence. "
+        "Check mechanisms, causal explanations and automatic actions especially: co-occurrence of a sensor and "
+        "an action does not establish that the sensor controls it. Do not accept a false premise in the question. "
+        "Missing evidence does not prove a premise false. Manual operation of one action does not establish "
+        "the mechanism of another action or rule out automation. "
         "Source numbers refer only to these visible passages."
     )
     prompt = _ANSWER_PROMPT.format(
@@ -238,7 +243,7 @@ def reflect_answer(
         verdict = _parse_verdict(raw)
         logger.debug(
             f"Answer reflection — supported={verdict.is_supported} "
-            f"useful={verdict.is_useful} | {verdict.reasoning}"
+            f"useful={verdict.is_useful}"
         )
         return verdict
     except Exception as exc:

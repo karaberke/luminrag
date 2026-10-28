@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from backend.utils.environment import hosted_mode
 
-Provider = Literal["anthropic", "openrouter", "ollama"]
+Provider = Literal["anthropic", "openrouter", "openai", "ollama"]
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
 _FAST_SECTIONS = (
     "captioning", "topic_extractor", "subtopic_extractor", "content_synthesizer",
@@ -41,8 +41,8 @@ def get_credentials(request: Request) -> LLMCredentials | None:
     if not any(values) and not is_hosted():
         return None
     provider, key, fast, smart = values
-    if provider not in ("anthropic", "openrouter", "ollama") or (is_hosted() and provider == "ollama"):
-        raise HTTPException(401, "Connect an OpenRouter or Anthropic account in Settings.")
+    if provider not in ("anthropic", "openrouter", "openai", "ollama") or (is_hosted() and provider == "ollama"):
+        raise HTTPException(401, "Connect OpenAI, OpenRouter or Anthropic in Settings.")
     if provider != "ollama" and (not key or len(key) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in key)):
         raise HTTPException(401, "A valid provider key is required.")
     if not _MODEL.fullmatch(fast) or not _MODEL.fullmatch(smart):

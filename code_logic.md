@@ -14,13 +14,34 @@ A single fetch helper (`frontend/src/utils/api.ts`) supplies workspace and reque
 
 Fast models handle extraction, routing, captioning, decomposition, reflection. Smart models compose answers. Fast query mode skips question decomposition and reflection gates; Thorough retains the full verification pipeline. Retrieval uses FastEmbed BAAI/bge-small-en-v1.5 passages/query encoding, NumPy exact cosine top-k, and Xenova/ms-marco-MiniLM-L-6-v2 ONNX reranking.
 
+Direct OpenAI, Anthropic and OpenRouter use fixed official endpoints; native
+OpenAI uses strict structured output and completion-token budgets. Model
+preferences persist, while all customer keys stay in memory. Skipped and
+unavailable verification have explicit states and neutral UI; Thorough mode
+withholds an answer when its source-support check fails.
+
 Final answer generation returns Markdown and numbered supporting quotes in one structured provider call. Quote spans must match the actual numbered context passage and a citation used in the answer. Unverifiable quotes are discarded. Evidence responses retain complete passages, original filenames, sections, PDF page ranges and slide numbers. The browser lazily opens original-document previews, selects the cited PDF page or matching Word paragraph, and highlights validated supporting text. Missing originals and unmatched text retain a readable extracted-passage fallback. Word preview pages honor explicit breaks but do not promise Microsoft Word's pagination.
 
 ## Ingestion and publishing
 
 Uploads are bounded, validated and staged. PDF and slide processors preserve text/page provenance and extract bounded source images. Image uploads use the shared captioner. Markdown/text use heading-aware chunking. Microsoft's MarkItDown handles local Office/HTML/EPUB streams with plugins disabled. Hosted mode rejects audio/video; self-hosted installations can install the optional A/V requirements.
 
-The hierarchy pipeline extracts topics, subtopics and content, retaining directed HAS_SUBTOPIC and HAS_CONTENT edges. A bounded similarity shortlist proposes semantic pairs (up to16 neighbors,80 pairs, batches of10). The verifier receives concept summaries and up to two source excerpts per endpoint, each bounded to1200 characters. It returns a related/not-related decision, finite confidence and supporting passage IDs. Accepted IDs must come from the supplied context and cover both concepts. Missing context or unsupported decisions produce no connection. This preserves the existing linking-call pattern and numerical thresholds; it does not force links between unrelated topics.
+The hierarchy pipeline extracts per-document topics, then groups up to eight
+same-source passages and 6,000 source characters into one combined subtopic/content
+request. Original citation passages remain separate. Each response accounts for
+every passage, validates source IDs and parents, and checks excerpts against its
+own cited passages. Up to four context-preserving I/O workers run independent
+requests; immutable synonym pools avoid re-embedding existing names per proposal.
+`graph_extraction.mode: separate` retains the earlier per-passage stages. The
+hierarchy retains directed HAS_SUBTOPIC and HAS_CONTENT edges. A bounded
+similarity shortlist proposes semantic pairs (up to16 neighbors,80 pairs,
+batches of10). The verifier receives concept summaries and up to two source
+excerpts per endpoint, each bounded to1200 characters. It returns a
+related/not-related decision, finite confidence and supporting passage IDs.
+Accepted IDs must come from the supplied context and cover both concepts.
+Missing context or unsupported decisions produce no connection. This preserves
+the existing linking-call pattern and numerical thresholds; it does not force
+links between unrelated topics.
 
 backend/utils/associations.py normalizes semantic pairs into a single symmetric RELATED_TO edge with a stable hashed identity and no display label. Separate automatic, manual, note-wikilink and legacy records retain their confidence and source IDs. Verified automatic backing is invalidated when any required passage is removed; manual backing survives. Source cleanup retains endpoints of surviving connections and their hierarchy ancestors, even if those concepts no longer have a source passage. Removing a wikilink only removes its owner's backing; explicitly deleting a connection removes all backing, which its inverse restores. Editing note citation text invalidates incident automatic grounding. Loading/exporting/importing old graphs folds reversed/labeled edges without model calls or upgrading legacy provenance to verified. Nodes, hierarchy, evidence and positions are preserved.
 
@@ -34,4 +55,11 @@ POST/api/graph/ops applies an ordered atomic batch to a candidate graph. Sparse 
 
 ## Deployment boundary
 
-Cloudflare Pages serves static frontend assets over HTTPS. HF Docker Spaces run one slim Python process with pretrained ONNX models. Deploy the prepared Space folder, whose root Dockerfile is Dockerfile.hosted. Cloud Run uses the same image, maximum one instance and instance-based CPU billing for background ingestion. Readiness is public and contains no corpus information. ALLOWED_ORIGINS is an exact frontend-origin allowlist. Rate/body/file/archive/image/model-admission limits protect shared compute. Self-hosted access retains its local/token authentication.
+The default Docker Compose stack runs the website, slim hosted backend and a
+dedicated Cloudflare Tunnel connector in one isolated network namespace, without
+host ports. Only the connector receives the tunnel token. The backend has
+bounded CPU, memory, temporary storage, workspace and inference admission limits.
+The hosted image is also portable to other supported container hosts. Readiness
+is public and contains no corpus information. ALLOWED_ORIGINS is an exact
+frontend-origin allowlist. Rate/body/file/archive/image/model-admission limits
+protect shared compute. Self-hosted access retains its local/token authentication.

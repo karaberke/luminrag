@@ -44,7 +44,7 @@ LuminRAG is an educational question-answering app that connects your documents t
 | **Choose your retrieval** | Use dense, graph or hybrid retrieval; choose Fast or Thorough reasoning. |
 | **Bring your material** | Import PDFs, images, Office files, HTML, EPUB, Markdown and text. Self-hosted audio/video is optional. |
 | **Keep portable knowledge bases** | Store files, graphs and chats in your browser; export `.lumin` backups to move between devices. |
-| **Choose your AI provider** | Connect OpenRouter or Anthropic with your own key. Self-hosting also supports Ollama. |
+| **Choose your AI provider** | Connect OpenAI, OpenRouter or Anthropic with your own key. Search the OpenRouter model catalog or enter a model ID. Self-hosting also supports Ollama. |
 
 ## How it works
 

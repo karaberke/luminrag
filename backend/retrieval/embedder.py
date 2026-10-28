@@ -23,7 +23,7 @@ import numpy as np
 from backend.utils.resources import ModelResourcesBusy, model_resource_timeout
 from backend.utils.models import pinned_model_path
 
-EMBEDDING_BATCH_SIZE = 64
+EMBEDDING_BATCH_SIZE = 32
 
 
 class Embedder:
@@ -87,13 +87,18 @@ class Embedder:
         # A large import must not reserve the shared tokenizer/model for its
         # entire corpus. Release it between bounded native inference batches.
         vectors = np.empty((len(texts), self.dimension), dtype=np.float32)
+        # Similar-length passages waste less tokenizer padding/native compute.
+        # Only inference order changes; callers retain exact input row order.
+        lengths = np.fromiter((len(text) for text in texts), dtype=np.intp, count=len(texts))
+        positions = np.argsort(lengths, kind="stable")
         for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+            selected = positions[start:start + EMBEDDING_BATCH_SIZE]
+            batch = [texts[index] for index in selected]
             with self._reserve_inference():
                 result = np.asarray(list(self._model.embed(batch, batch_size=EMBEDDING_BATCH_SIZE)), dtype=np.float32)
             if result.shape != (len(batch), self.dimension):
                 raise ValueError("Embedding model returned an unexpected number of vectors.")
-            vectors[start:start + len(batch)] = self._normalize(result)
+            vectors[selected] = self._normalize(result)
         return vectors
 
     def _normalize(self, vecs: np.ndarray) -> np.ndarray:

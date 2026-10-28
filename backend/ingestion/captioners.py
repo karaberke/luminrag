@@ -58,8 +58,8 @@ class AnthropicCaptioner(LLMCaptioner):
 
 def build_captioner(cfg: dict) -> BaseCaptioner:
     section = cfg.get("captioning", {})
-    if section.get("provider", "ollama") not in {"ollama", "anthropic", "openrouter"}:
-        raise ValueError("Unknown captioning provider; choose Ollama, Anthropic or OpenRouter.")
+    if section.get("provider", "ollama") not in {"ollama", "anthropic", "openrouter", "openai"}:
+        raise ValueError("Unknown captioning provider; choose Ollama, Anthropic, OpenRouter or OpenAI.")
     return LLMCaptioner(section)
 
 

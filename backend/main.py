@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 from backend.utils.environment import hosted_mode
 
@@ -102,6 +102,8 @@ from backend.utils.jobs import (
     REGISTRY_LOCK,
     prune_terminal_jobs,
     register_job,
+    ingestion_workers,
+    map_bounded,
 )
 from backend.retrieval.embedder import Embedder
 from backend.retrieval.vector_retriever import VectorIndex
@@ -554,6 +556,7 @@ class ReflectionVerdictResponse(BaseModel):
     is_supported: bool
     is_useful: bool
     reasoning: str
+    verification_status: Literal["verified", "skipped", "unavailable"] = "verified"
 
 
 class QueryResponse(BaseModel):
@@ -924,6 +927,7 @@ def _run_graph_pipeline(
     *,
     warm_cache: bool = True,
     context_chunks: list[Chunk] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> "ApplyResult":
     """
     Stages 1.2–1.5 + Stage 2 of the ingest pipeline. All synchronous LLM
@@ -933,50 +937,98 @@ def _run_graph_pipeline(
     from backend.graph.topic_extractor import extract_topics
     from backend.graph.subtopic_extractor import extract_subtopics
     from backend.graph.content_synthesizer import synthesize_contents
+    from backend.graph.chunk_extractor import extract_batch_concepts
+    from backend.graph._llm import SynonymResolver
     from backend.graph.semantic_linker import link_graph_changes, snapshot_linkable_texts
+    from backend.utils.chunking import graph_passage_batches
 
     graph = graph_builder.graph
     previous_linkable_texts = snapshot_linkable_texts(graph)
 
-    preview = _make_doc_preview(all_chunks, filenames)
-    topic_proposals = extract_topics(
-        preview,
-        [c.id for c in all_chunks],
-        config,
-        existing_names=_names_by_type(graph, "topic"),
-        embedder=embedder,
-    )
+    started = time.perf_counter()
+    if on_progress:
+        on_progress("Identifying document topics…")
+    extraction_cfg = config.get("graph_extraction", {})
+    workers = ingestion_workers(extraction_cfg)
+    separate = extraction_cfg.get("mode", "combined") == "separate"
+    source_groups: dict[str, list[Chunk]] = {}
+    for chunk in all_chunks:
+        source_groups.setdefault(chunk.source_id, []).append(chunk)
+
+    def document_topics(chunks: list[Chunk]):
+        names = [chunks[0].metadata.get("original_filename") or chunks[0].source_id]
+        return extract_topics(
+            _make_doc_preview(chunks, names), [chunk.id for chunk in chunks], config,
+            existing_names=_names_by_type(graph, "topic"), embedder=embedder,
+        )
+
+    if separate:
+        topic_proposals = extract_topics(
+            _make_doc_preview(all_chunks, filenames), [chunk.id for chunk in all_chunks], config,
+            existing_names=_names_by_type(graph, "topic"), embedder=embedder,
+        )
+        topics_by_source = {}
+    else:
+        topic_batches = map_bounded(document_topics, list(source_groups.values()), max_workers=workers)
+        topics_by_source = {source_id: [proposal.name for proposal in proposals]
+                            for source_id, proposals in zip(source_groups, topic_batches)}
+        topic_proposals = [proposal for proposals in topic_batches for proposal in proposals]
     topic_names = [tp.name for tp in topic_proposals]
     logger.info(f"Topics: {len(topic_proposals)} — {topic_names}")
+    logger.info("Ingestion stage topics: %.3fs", time.perf_counter() - started)
 
-    subtopic_proposals = extract_subtopics(
-        all_chunks,
-        topic_names,
-        config,
-        existing_names=_names_by_type(graph, "subtopic"),
-        embedder=embedder,
-    )
-    logger.info(f"Subtopics: {len(subtopic_proposals)}")
-
-    subs_by_chunk: dict[str, list[str]] = {}
-    for sp in subtopic_proposals:
-        for cid in sp.source_chunk_ids:
-            subs_by_chunk.setdefault(cid, []).append(sp.name)
-
+    started = time.perf_counter()
+    existing_subtopics = _names_by_type(graph, "subtopic")
     existing_titles = _names_by_type(graph, "content")
-    content_proposals = []
-    for chunk in all_chunks:
-        content_proposals.extend(
-            synthesize_contents(
-                chunk,
-                subs_by_chunk.get(chunk.id, []),
-                topic_names,
-                config,
-                existing_titles=existing_titles,
-                embedder=embedder,
-            )
+    sub_resolver = SynonymResolver(existing_subtopics, embedder, float(config.get("subtopic_extractor", {}).get("merge_threshold", .82)))
+    content_resolver = SynonymResolver(existing_titles, embedder, float(config.get("content_synthesizer", {}).get("merge_threshold", .88)))
+
+    def completed(stage: str, count: int, total: int, unit: str = "passages") -> None:
+        if on_progress:
+            on_progress(f"{stage} {count}/{total} {unit}…")
+
+    no_content_ids: set[str] = set()
+    if separate:
+        subtopic_proposals = extract_subtopics(
+            all_chunks, topic_names, config, existing_names=existing_subtopics,
+            embedder=embedder, on_completed=lambda count, total: completed("Mapping subtopics", count, total),
         )
-    logger.info(f"Contents: {len(content_proposals)}")
+        subs_by_chunk: dict[str, list[str]] = {}
+        for proposal in subtopic_proposals:
+            for cid in proposal.source_chunk_ids:
+                subs_by_chunk.setdefault(cid, []).append(proposal.name)
+        batches = map_bounded(
+            lambda chunk: synthesize_contents(
+                chunk, subs_by_chunk.get(chunk.id, []), topic_names, config,
+                existing_titles=existing_titles, embedder=embedder, synonym_resolver=content_resolver,
+            ), all_chunks, max_workers=workers,
+            on_completed=lambda count, total: completed("Building concept cards", count, total),
+        )
+        content_proposals = [proposal for batch in batches for proposal in batch]
+    else:
+        passage_batches = graph_passage_batches(
+            all_chunks, max_chars=extraction_cfg.get("max_batch_chars", 6000),
+            max_passages=extraction_cfg.get("max_batch_passages", 8),
+        )
+        completed("Building concepts", 0, len(passage_batches), "batches")
+        batches = map_bounded(
+            lambda chunks: extract_batch_concepts(
+                chunks, topics_by_source[chunks[0].source_id], config, sub_resolver, content_resolver,
+            ), passage_batches, max_workers=workers,
+            on_completed=lambda count, total: completed("Building concepts", count, total, "batches"),
+        )
+        subtopic_proposals = [proposal for batch in batches for proposal in batch.subtopics]
+        content_proposals = [proposal for batch in batches for proposal in batch.contents]
+        no_content_ids = {cid for batch in batches for cid in batch.no_content_chunk_ids}
+        no_content_ids.difference_update(cid for proposal in subtopic_proposals for cid in proposal.source_chunk_ids)
+        no_content_ids.difference_update(cid for proposal in content_proposals for cid in proposal.evidence_chunk_ids)
+    logger.info("Ingestion stage concepts: %.3fs (%d passages, %d workers)",
+                time.perf_counter() - started, len(all_chunks), workers)
+    logger.info("Subtopics: %d; Contents: %d", len(subtopic_proposals), len(content_proposals))
+
+    started = time.perf_counter()
+    if on_progress:
+        on_progress("Applying concepts and verifying connections…")
 
     apply_result = graph_builder.apply_proposals(
         ProposalBundle(
@@ -985,6 +1037,11 @@ def _run_graph_pipeline(
             contents=content_proposals,
         )
     )
+    if no_content_ids:
+        apply_result.warnings.append(f"{len(no_content_ids)} passage(s) had no teachable concepts; they remain searchable as source text.")
+    if hosted_mode():
+        # Reject an oversized candidate before similarity work or paid linking.
+        validate_workspace_data(context_chunks if context_chunks is not None else all_chunks, graph_builder.graph)
 
     related_proposals = link_graph_changes(
         graph_builder.graph, previous_linkable_texts, embedder, config,
@@ -1010,6 +1067,7 @@ def _run_graph_pipeline(
     if warm_cache:
         warm_graph_retriever(graph_builder.graph, embedder)
         logger.info("Graph retriever re-warmed.")
+    logger.info("Ingestion stage graph connections and export: %.3fs", time.perf_counter() - started)
 
     return apply_result
 
@@ -1198,6 +1256,7 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
     snapshot = run_locked(_snapshot_ingest, job, epoch, job_dir)
     if snapshot is None:
         return
+    stage_started = time.perf_counter()
     # Stage 1 — per-file chunking (Ollama vision calls for slides; CPU for PDFs)
     all_chunks: list[Chunk] = []
     failed: list[str] = []
@@ -1216,6 +1275,8 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
 
     if not all_chunks:
         raise ValueError(f"No chunks produced. Failed: {', '.join(failed) or 'none'}")
+    logger.info("Ingestion stage parsing: %.3fs (%d files, %d passages)",
+                time.perf_counter() - stage_started, len(staged), len(all_chunks))
 
     if not run_locked(_ingest_snapshot_current, job, snapshot, epoch):
         return
@@ -1237,10 +1298,12 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
             logger.info(f"Graph reconciled after source replacement: {stats}")
 
     job.progress_stage = "Building vector index…"
+    stage_started = time.perf_counter()
     candidate_index_path = candidate_dir / "faiss.index"
     new_index = VectorIndex(snapshot.embedder)
     new_index.build(candidate_chunks, reuse_from=snapshot.vector_index, previous_chunks=stored)
     new_index.save(candidate_index_path)
+    logger.info("Ingestion stage embedding and index: %.3fs", time.perf_counter() - stage_started)
 
     job.progress_stage = "Extracting topics & subtopics…"
     apply_result = _run_graph_pipeline(
@@ -1252,6 +1315,7 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
         snapshot.embedder,
         warm_cache=False,
         context_chunks=candidate_chunks,
+        on_progress=lambda stage: setattr(job, "progress_stage", stage),
     )
 
     if hosted_mode():
@@ -1816,6 +1880,7 @@ def _no_documents_response() -> QueryResponse:
             is_supported=False,
             is_useful=False,
             reasoning="No vector index or concept graph is available.",
+            verification_status="skipped",
         ),
         hops=[],
     )

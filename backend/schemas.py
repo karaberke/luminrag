@@ -67,6 +67,7 @@ class ReflectionVerdict(BaseModel):
     is_supported: bool
     is_useful: bool
     reasoning: str
+    verification_status: Literal["verified", "skipped", "unavailable"] = "verified"
 
 
 class CitationSpan(BaseModel):

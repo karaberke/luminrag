@@ -35,7 +35,7 @@ const evidence = z.object({ id: identifier, text, source: identifier,
 })
 const message = z.object({ id: identifier, role: z.enum(['user', 'assistant']), content: text, timestamp: z.coerce.date(),
   routing_mode: z.enum(['dense', 'graph', 'hybrid', 'none']).optional(), evidence: z.array(evidence).max(10_000).optional(),
-  reflection: z.object({ needs_retrieval: z.boolean(), is_relevant: z.boolean(), is_supported: z.boolean(), is_useful: z.boolean(), reasoning: text }).optional(),
+  reflection: z.object({ verification_status: z.enum(['verified', 'skipped', 'unavailable']).optional(), needs_retrieval: z.boolean(), is_relevant: z.boolean(), is_supported: z.boolean(), is_useful: z.boolean(), reasoning: text }).optional(),
   hops: strings.optional(),
 })
 export const browserMetadataSchema = z.object({
