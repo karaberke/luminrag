@@ -937,20 +937,34 @@ def _run_graph_pipeline(
     from backend.graph.topic_extractor import extract_topics
     from backend.graph.subtopic_extractor import extract_subtopics
     from backend.graph.content_synthesizer import synthesize_contents
-    from backend.graph.chunk_extractor import extract_batch_concepts
+    from backend.graph.chunk_extractor import extract_batch_concepts, extract_document_concepts
     from backend.graph._llm import SynonymResolver
     from backend.graph.semantic_linker import link_graph_changes, snapshot_linkable_texts
-    from backend.utils.chunking import graph_passage_batches
+    from backend.utils.chunking import graph_document_batches, graph_passage_batches
 
     graph = graph_builder.graph
     previous_linkable_texts = snapshot_linkable_texts(graph)
 
     started = time.perf_counter()
-    if on_progress:
-        on_progress("Identifying document topics…")
     extraction_cfg = config.get("graph_extraction", {})
+    mode = extraction_cfg.get("mode", "combined")
+    if mode == "compact" and config.get("content_synthesizer", {}).get("provider") == "ollama":
+        mode = extraction_cfg.get("local_mode", "combined")
+        if mode not in {"combined", "compact"}:
+            raise ValueError("graph_extraction.local_mode must be combined or compact.")
+        if mode == "combined":
+            # Local Ollama's OpenAI interface cannot raise its context window.
+            # Retain the smaller existing path unless the operator opts in.
+            extraction_cfg = {**extraction_cfg, "mode": mode,
+                              "max_workers": min(4, int(extraction_cfg.get("max_workers", 4))),
+                              "max_batch_passages": min(8, int(extraction_cfg.get("max_batch_passages", 8))),
+                              "max_batch_chars": min(6000, int(extraction_cfg.get("max_batch_chars", 6000)))}
+            config = {**config, "graph_extraction": extraction_cfg}
     workers = ingestion_workers(extraction_cfg)
-    separate = extraction_cfg.get("mode", "combined") == "separate"
+    separate = mode == "separate"
+    compact = mode == "compact"
+    if on_progress:
+        on_progress("Building document concepts…" if compact else "Identifying document topics…")
     source_groups: dict[str, list[Chunk]] = {}
     for chunk in all_chunks:
         source_groups.setdefault(chunk.source_id, []).append(chunk)
@@ -962,7 +976,10 @@ def _run_graph_pipeline(
             existing_names=_names_by_type(graph, "topic"), embedder=embedder,
         )
 
-    if separate:
+    if compact:
+        topic_proposals = []
+        topics_by_source = {}
+    elif separate:
         topic_proposals = extract_topics(
             _make_doc_preview(all_chunks, filenames), [chunk.id for chunk in all_chunks], config,
             existing_names=_names_by_type(graph, "topic"), embedder=embedder,
@@ -974,8 +991,8 @@ def _run_graph_pipeline(
                             for source_id, proposals in zip(source_groups, topic_batches)}
         topic_proposals = [proposal for proposals in topic_batches for proposal in proposals]
     topic_names = [tp.name for tp in topic_proposals]
-    logger.info(f"Topics: {len(topic_proposals)} — {topic_names}")
-    logger.info("Ingestion stage topics: %.3fs", time.perf_counter() - started)
+    if not compact:
+        logger.info("Ingestion stage topics: %.3fs", time.perf_counter() - started)
 
     started = time.perf_counter()
     existing_subtopics = _names_by_type(graph, "subtopic")
@@ -988,7 +1005,25 @@ def _run_graph_pipeline(
             on_progress(f"{stage} {count}/{total} {unit}…")
 
     no_content_ids: set[str] = set()
-    if separate:
+    if compact:
+        topic_resolver = SynonymResolver(_names_by_type(graph, "topic"), embedder,
+                                        float(config.get("topic_extractor", {}).get("merge_threshold", .85)))
+        passage_batches = graph_document_batches(
+            all_chunks, max_chars=extraction_cfg.get("max_batch_chars", 32000),
+            max_passages=extraction_cfg.get("max_batch_passages", 64),
+        )
+        completed("Building concepts", 0, len(passage_batches), "document sections")
+        batches = map_bounded(
+            lambda chunks: extract_document_concepts(chunks, config, topic_resolver, sub_resolver, content_resolver),
+            passage_batches, max_workers=workers,
+            on_completed=lambda count, total: completed("Building concepts", count, total, "document sections"),
+        )
+        topic_proposals = [proposal for batch in batches for proposal in batch.topics]
+        subtopic_proposals = [proposal for batch in batches for proposal in batch.subtopics]
+        content_proposals = [proposal for batch in batches for proposal in batch.contents]
+        no_content_ids = {cid for batch in batches for cid in batch.no_content_chunk_ids}
+        no_content_ids.difference_update(cid for proposal in content_proposals for cid in proposal.evidence_chunk_ids)
+    elif separate:
         subtopic_proposals = extract_subtopics(
             all_chunks, topic_names, config, existing_names=existing_subtopics,
             embedder=embedder, on_completed=lambda count, total: completed("Mapping subtopics", count, total),
@@ -1024,6 +1059,7 @@ def _run_graph_pipeline(
         no_content_ids.difference_update(cid for proposal in content_proposals for cid in proposal.evidence_chunk_ids)
     logger.info("Ingestion stage concepts: %.3fs (%d passages, %d workers)",
                 time.perf_counter() - started, len(all_chunks), workers)
+    logger.info("Topics: %d", len(topic_proposals))
     logger.info("Subtopics: %d; Contents: %d", len(subtopic_proposals), len(content_proposals))
 
     started = time.perf_counter()
@@ -1297,25 +1333,34 @@ def _build_ingest(job: _IngestJob, staged: list[StagedFile], epoch: int, job_dir
         if any(stats.values()):
             logger.info(f"Graph reconciled after source replacement: {stats}")
 
-    job.progress_stage = "Building vector index…"
-    stage_started = time.perf_counter()
+    job.progress_stage = "Building source index and document concepts…"
     candidate_index_path = candidate_dir / "faiss.index"
-    new_index = VectorIndex(snapshot.embedder)
-    new_index.build(candidate_chunks, reuse_from=snapshot.vector_index, previous_chunks=stored)
-    new_index.save(candidate_index_path)
-    logger.info("Ingestion stage embedding and index: %.3fs", time.perf_counter() - stage_started)
+    def build_index():
+        started = time.perf_counter()
+        index = VectorIndex(snapshot.embedder)
+        index.build(candidate_chunks, reuse_from=snapshot.vector_index, previous_chunks=stored)
+        index.save(candidate_index_path)
+        logger.info("Ingestion stage embedding and index: %.3fs", time.perf_counter() - started)
+        return index
 
-    job.progress_stage = "Extracting topics & subtopics…"
-    apply_result = _run_graph_pipeline(
-        all_chunks,
-        [item.original_filename for item in staged],
-        candidate_graph_path,
-        snapshot.config,
-        builder,
-        snapshot.embedder,
-        warm_cache=False,
-        context_chunks=candidate_chunks,
-        on_progress=lambda stage: setattr(job, "progress_stage", stage),
+    def build_graph():
+        return _run_graph_pipeline(
+            all_chunks,
+            [item.original_filename for item in staged],
+            candidate_graph_path,
+            snapshot.config,
+            builder,
+            snapshot.embedder,
+            warm_cache=False,
+            context_chunks=candidate_chunks,
+            on_progress=lambda stage: setattr(job, "progress_stage", stage),
+        )
+
+    # Native model inference already has one shared bounded resource gate.
+    # Overlap its CPU work with provider I/O without publishing either candidate
+    # early. Context-scoped workspace paths and credentials follow both tasks.
+    new_index, apply_result = map_bounded(
+        lambda build: build(), [build_index, build_graph], max_workers=2,
     )
 
     if hosted_mode():

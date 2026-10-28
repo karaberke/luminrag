@@ -4,7 +4,8 @@ Stage 3 - Query Routing: query_router.py
 Decides which retrieval mode to use for a given question:
   "dense"  — single-hop factual lookup (vector DB)
   "graph"  — relational/multi-concept query (knowledge graph traversal)
-  "none"   — no retrieval needed (trivial input, greeting, etc.)
+  "hybrid" — explicit comparison/summary across several documents (heuristic only)
+  "none"  — no retrieval needed (trivial input, greeting, etc.)
 
 Two-pass hybrid approach:
   Pass 1: Heuristic rules — instant, no LLM call, covers obvious cases.
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 
 from backend.llm import structured
 from backend.schemas import RoutingMode
+from backend.utils.query_intent import multi_document_source_limit
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,12 @@ def _classify_heuristic(question: str) -> RoutingMode | None:
         return "none"
 
     q_lower = q.lower()
+
+    # An explicit comparison across several documents needs both dense
+    # coverage of every source and graph relations; "how do" alone must not
+    # narrow it to graph topics from one document.
+    if multi_document_source_limit(q):
+        return "hybrid"
 
     # Graph signals first — "why does X affect Y?" beats any other pattern
     if any(q_lower.startswith(p) for p in _GRAPH_PREFIXES):

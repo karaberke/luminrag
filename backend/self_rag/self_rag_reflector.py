@@ -31,7 +31,7 @@ import re
 
 from backend.llm import structured
 from backend.schemas import ReflectionVerdict, RetrievalResult
-from backend.utils.context import DEFAULT_GENERATION_CONTEXT_CHARS, format_context as _format_context
+from backend.utils.context import format_context as _format_context, generation_context_chars
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,7 @@ def reflect_retrieval(
     cfg = config.get("self_rag", {})
     max_chars = cfg.get("max_context_chars", 2000)
 
-    context = _format_context(retrieval_result, max_chars)
+    context = _format_context(retrieval_result, max_chars, question=question)
     prompt = _RETRIEVAL_PROMPT.format(question=question, context=context)
 
     try:
@@ -220,9 +220,11 @@ def reflect_answer(
         ReflectionVerdict with all four fields populated.
     """
     cfg = config.get("self_rag", {})
-    max_chars = config.get("generator", {}).get("max_context_chars", DEFAULT_GENERATION_CONTEXT_CHARS)
+    # The shared generation budget plus the question reproduces generation's view.
+    max_chars = generation_context_chars(question, config)
     conversation = retrieval_result.routing_mode == "none"
-    context = "(no source context required)" if conversation else _format_context(retrieval_result, max_chars)
+    context = ("(no source context required)" if conversation
+               else _format_context(retrieval_result, max_chars, question=question))
     support_criterion = (
         "For this ordinary conversation, assess factual accuracy using general knowledge. No course-source citation is required."
         if conversation else

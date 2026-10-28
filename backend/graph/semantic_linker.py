@@ -26,6 +26,7 @@ from backend.graph._llm import safe_call_json
 from backend.graph.schema import RelatedToProposal
 from backend.schemas import Chunk
 from backend.utils.associations import MAX_CHUNK_IDENTIFIER_LENGTH
+from backend.utils.jobs import ingestion_workers, map_bounded
 from backend.utils.text import node_text
 
 if TYPE_CHECKING:
@@ -271,14 +272,20 @@ def link_nodes(
         logger.info("Semantic linking: no candidate pairs in [%.2f, %.2f]", sim_lo, sim_hi)
         return []
 
-    proposals: list[RelatedToProposal] = []
-    # Batch pairs to keep prompt length bounded.
-    for batch_start in range(0, len(candidates), batch_size):
-        batch = candidates[batch_start : batch_start + batch_size]
+    # Verification only reads detached contexts. Keep provider waits concurrent,
+    # then validate and apply results in the original deterministic pair order.
+    batches = [candidates[start : start + batch_size] for start in range(0, len(candidates), batch_size)]
+
+    def verify(batch):
         # Re-index batch 0..len(batch)-1 so the LLM indices map cleanly.
         indexed = [(i, a, b) for i, (_, a, b, _) in enumerate(batch)]
         prompt = _PROMPT.format(pairs_block=_build_pairs_block(indexed))
-        parsed = safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2048), response_model=_ConnectionItems)
+        return safe_call_json(prompt, cfg, max_tokens=cfg.get("max_tokens", 2048), response_model=_ConnectionItems)
+
+    worker_cfg = {**config.get("graph_extraction", {}), **cfg}
+    responses = map_bounded(verify, batches, max_workers=ingestion_workers(worker_cfg))
+    proposals: list[RelatedToProposal] = []
+    for batch, parsed in zip(batches, responses):
         if not isinstance(parsed, list) or len(parsed) > MAX_BATCH_PAIRS:
             continue
         indices = Counter(entry.get("index") for entry in parsed

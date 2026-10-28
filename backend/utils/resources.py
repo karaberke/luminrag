@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import threading
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Final
 
 
 _allow_waiting: ContextVar[bool] = ContextVar("allow_model_resource_waiting", default=True)
 INTERACTIVE_RESOURCE_TIMEOUT = 0.25
+# ONNX Runtime's CPU arena keeps peak batch memory reserved; disable it for
+# every pinned model so embedding and reranking peaks do not stack.
+NATIVE_CPU_MEM_ARENA: Final[bool] = False
+
+# One native batch at a time across all models, admitted in arrival order.
+_native_condition = threading.Condition()
+_native_waiters: deque[object] = deque()
+_native_active = False
 
 
 class ModelResourcesBusy(RuntimeError):
@@ -54,3 +64,34 @@ def reserve_model_resource(lock: Any):
         yield
     finally:
         lock.release()
+
+
+@contextmanager
+def reserve_native_inference():
+    """Admit one process-wide native batch in FIFO order; not reentrant.
+
+    Take this inside any per-model reservation, never the other way around.
+    """
+    global _native_active
+    timeout = model_resource_timeout()
+    token = object()
+    with _native_condition:
+        _native_waiters.append(token)
+        try:
+            # Only the queue head may enter, so fresh arrivals cannot overtake.
+            admitted = _native_condition.wait_for(
+                lambda: not _native_active and _native_waiters[0] is token, timeout=timeout,
+            )
+            if admitted:
+                _native_active = True
+        finally:
+            _native_waiters.remove(token)
+            _native_condition.notify_all()
+        if not admitted:
+            raise ModelResourcesBusy()
+    try:
+        yield
+    finally:
+        with _native_condition:
+            _native_active = False
+            _native_condition.notify_all()

@@ -20,9 +20,9 @@ from backend.llm import structured
 from backend.schemas import CitationSpan, GenerationResult, ReflectionVerdict, RetrievalResult
 from backend.self_rag.self_rag_reflector import reflect_answer
 from backend.utils.context import (
-    DEFAULT_GENERATION_CONTEXT_CHARS,
     context_chunks as _context_chunks,
     format_context as _format_chunks,
+    generation_context_chars,
 )
 from backend.utils.text import find_quote_span
 from backend.generation.prompts import (
@@ -44,7 +44,7 @@ class _AnswerCitation(BaseModel):
 
 
 class _AnswerOutput(BaseModel):
-    citations: list[_AnswerCitation] = Field(default_factory=list, max_length=32)
+    citations: list[_AnswerCitation] = Field(max_length=32)
     answer: str = Field(min_length=1, description="The complete Markdown answer, preserving numbered citations [N].")
 
 
@@ -58,6 +58,17 @@ Copy spelling, punctuation and words exactly; never paraphrase or combine separa
 sentences into a quote. Cite only numbered passages shown in retrieved_context.
 If no passage supports a claim, say so. With no retrieved passages, citations is [].
 """
+
+_FAST_ANSWER_INSTRUCTIONS = """\
+Keep the answer concise: aim for around 150-200 words, shorter for simple questions.
+Still answer the question completely and use math where needed. Include every
+source reference needed to support the answer, with only the short exact quotes
+needed for those sources. The length is a guideline, never a reason to omit
+necessary evidence, sources or claims.
+"""
+
+# Room for a complete structured answer with quotes; explicit settings win.
+DEFAULT_GENERATION_MAX_TOKENS = 4096
 
 # ---------------------------------------------------------------------------
 # Context formatters
@@ -183,7 +194,7 @@ def _build_prompt(
     if mode == "none":
         return NO_RETRIEVAL_PROMPT.format(question=question)
 
-    context = _format_chunks(result, max_chars)
+    context = _format_chunks(result, max_chars, question=question)
 
     if mode == "graph":
         relationships = _format_relationships(result, max_chars)
@@ -232,11 +243,12 @@ def generate(
     Returns:
         GenerationResult with answer, routing_mode, reflection, evidence_chunk_ids.
     """
-    cfg = config.get("generator", {})
-    max_chars = cfg.get("max_context_chars", DEFAULT_GENERATION_CONTEXT_CHARS)
+    cfg = {"max_tokens": DEFAULT_GENERATION_MAX_TOKENS, **config.get("generator", {})}
+    max_chars = generation_context_chars(question, config)
 
     visible_result = retrieval_result.model_copy(update={
-        "chunks": _context_chunks(retrieval_result, max_chars) if retrieval_result.routing_mode != "none" else [],
+        "chunks": (_context_chunks(retrieval_result, max_chars, question=question)
+                   if retrieval_result.routing_mode != "none" else []),
     })
     if retrieval_result.routing_mode != "none" and not any(chunk.text.strip() for chunk in visible_result.chunks):
         # Retrieval and its source filters must not silently become a general-
@@ -255,9 +267,13 @@ def generate(
     prompt = _build_prompt(question, retrieval_result, max_chars)
     citations: list[CitationSpan] = []
 
+    system = SYSTEM_PROMPT + "\n\n" + _CITATION_INSTRUCTIONS
+    if config.get("query_mode") == "fast":
+        system += "\n" + _FAST_ANSWER_INSTRUCTIONS
+
     failed = False
     try:
-        output = _call_llm(prompt, SYSTEM_PROMPT + "\n\n" + _CITATION_INSTRUCTIONS, cfg)
+        output = _call_llm(prompt, system, cfg)
         answer = output.answer
         citations = _validate_citations(output, visible_result)
     except Exception as exc:
@@ -278,6 +294,8 @@ def generate(
                                        is_supported=False, is_useful=False, reasoning="Fast mode: answer verification was not run.",
                                        verification_status="skipped")
     else:
+        # Reflection formats the same question with generation_context_chars,
+        # so it sees exactly the numbered passages shown to generation.
         reflection = reflect_answer(question, retrieval_result, answer, config)
         if (retrieval_result.routing_mode != "none" and reflection.verification_status == "verified"
                 and not reflection.is_supported):

@@ -11,7 +11,7 @@ export const PROVIDER_DETAILS: Record<LlmProvider, { name: string; modelsUrl: st
 }
 export const MODEL_DEFAULTS = {
   openrouter: { fastModel: 'anthropic/claude-haiku-4.5', smartModel: 'anthropic/claude-sonnet-4.6' },
-  anthropic: { fastModel: 'claude-haiku-4-5', smartModel: 'claude-sonnet-4-6' },
+  anthropic: { fastModel: 'claude-haiku-5-5', smartModel: 'claude-sonnet-5-5' },
   openai: { fastModel: 'gpt-5.4-mini', smartModel: 'gpt-5.4' },
   ollama_cloud: { fastModel: 'gemma4:31b', smartModel: 'gpt-oss:120b' },
   ollama: { fastModel: 'llama3.2', smartModel: 'llama3.2' },

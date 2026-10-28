@@ -11,7 +11,7 @@
 | `LUMIN_MAX_WORKSPACE_BYTES` | Temporary workspace disk budget; default268435456 (2 5 6 MiB) |
 | `FASTEMBED_CACHE_PATH` | Shared ONNX model cache; baked into the hosted image |
 | `LUMIN_MODEL_THREADS` | ONNX threads per model; default2 |
-| `LUMINRAG_INGEST_LLM_WORKERS` | Graph-extraction provider I/O ceiling; default4, hard maximum8; independent of CPU threads |
+| `LUMINRAG_INGEST_LLM_WORKERS` | Graph-extraction provider I/O ceiling; default8, hard maximum8; independent of CPU threads |
 | `LUMINRAG_MAX_UPLOAD_BYTES` | Per-file byte limit |
 | `LUMINRAG_MAX_CONCURRENT_INFERENCE` | Process-wide answer-generation admission bound |
 | `FORWARDED_ALLOW_IPS` | Optional exact trusted proxy IPs/CIDRs for client-IP limits; never set blindly to `*` |
@@ -33,15 +33,53 @@ withholds an answer when its source check reports unsupported factual claims.
 An AI review can still miss errors; exact quote matching verifies a quote's
 location, not the truth of every statement in the answer.
 
-`graph_extraction` in `config/llm.yaml` groups up to eight same-source passages
-and 6,000 source characters for one combined subtopic/content request. The
-original retrieval passages and page/slide references stay unchanged. Responses
-must account for every supplied passage and use only its source IDs; unsupported
-quote text is discarded. Extraction runs with at most four concurrent provider
-requests by default. `mode: separate` retains the earlier per-passage stages.
-Connection verification remains bounded and source-grounded. Publishing the
-new passages, graph and vectors is still atomic; a separate vector-ready phase
-and lazy graph enrichment are future architecture work.
+Explicit multi-document comparisons and summaries use a separate 12,000-character
+passage budget (`generator.multi_document_max_context_chars`); ordinary questions
+keep 4,000 (`generator.max_context_chars`). The two settings are independent and
+each configured value is used as is. Per-question source caps still apply, and
+generation and answer verification see the same bounded numbered passages. A
+larger budget does not guarantee answer quality or latency, and it adds no
+provider calls and changes no provider or model.
+
+`graph_extraction` in `config/llm.yaml` defaults to compact document extraction:
+up to 64 same-source passages and 32,000 source characters per request, with
+topics, subtopics and concise concept cards produced together. The original
+retrieval passages and page/slide references stay unchanged. A slide and its
+speaker notes form one extraction view, retaining every original passage ID.
+Every view needs an explicit evidence or no-content classification. Every card
+requires a primary source; unrecognized extra references are discarded only
+when valid independent backing still covers the view. Uncovered material,
+incomplete output and invalid primary references fail before publication.
+Compact cards omit repeated quotations and keyword lists; answers still return
+quotes checked against the full original passages.
+`mode: combined` retains the smaller eight-passage extraction path, and
+`mode: separate` retains the earlier per-passage stages.
+
+Private local Ollama uses `local_mode: combined` by default, keeping extraction
+requests within eight passages, 6,000 source characters and four workers. This selects the
+existing smaller extraction path without changing the provider or model.
+To opt into larger requests, set `local_mode: compact` and configure at least
+a 32K context on the Ollama server, for example with
+`OLLAMA_CONTEXT_LENGTH=32768` or a model created from a Modelfile containing
+`PARAMETER num_ctx 32768`. Confirm the allocated context with `ollama ps` and
+allow additional room for unusually token-dense sources. Larger contexts need
+more memory. Ollama's OpenAI-compatible API cannot set `num_ctx` per request.
+See the official [context guide](https://docs.ollama.com/context-length) and
+[model configuration instructions](https://docs.ollama.com/api/openai-compatibility#setting-the-local-context-size).
+Remote Anthropic, OpenAI, OpenRouter and Ollama Cloud keep compact extraction.
+
+Source indexing overlaps provider requests. Extraction and connection
+verification use at most eight concurrent provider requests by default, while
+native embedding work remains serialized in bounded batches. Connection checks
+retain their existing candidate and evidence limits. Valid graph search vectors
+survive candidate/publication cloning, so the first question does not rebuild
+the same node embeddings. Publication of passages, graph and vectors remains
+atomic; no unfinished graph is presented as complete. Processing time depends
+on document size, CPU availability, provider latency and server queueing.
+
+New Anthropic selections default to `claude-haiku-5-5` for extraction and
+`claude-sonnet-5-5` for answers. Saved model preferences remain editable; no
+visitor credential is stored with them.
 
 Hosted requests carry `X-Workspace-Id` (canonical random UUID4). Provider operations additionally use `X-LLM-Provider`, `X-LLM-Key`, `X-LLM-Model-Fast` and `X-LLM-Model-Smart`. The UUID is a secret capability, so keep it out of URLs and logs. There is no application login in v1.
 

@@ -13,7 +13,7 @@ captioning:
 
   # Anthropic settings (active when provider: anthropic)
   # Reads ANTHROPIC_API_KEY from environment automatically
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
 
   max_tokens: 150
 
@@ -48,7 +48,7 @@ query_router:
   llm_provider: ollama          # ollama | anthropic
   llm_ollama_model: qwen2.5:7b
   llm_ollama_base_url: http://localhost:11434
-  llm_anthropic_model: claude-haiku-4-5-20251001
+  llm_anthropic_model: claude-haiku-5-5
   llm_max_tokens: 50
 
 generator:
@@ -58,15 +58,16 @@ generator:
   provider: ollama             # ollama | anthropic
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
-  max_tokens: 1024
+  anthropic_model: claude-sonnet-5-5
+  max_tokens: 4096
   max_context_chars: 4000     # chars of retrieved context fed into the generation prompt
+  multi_document_max_context_chars: 12000  # same, for explicit multi-document comparisons/summaries
 
 multi_hop_reasoner:
   provider: ollama             # ollama | anthropic
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 256
   max_sub_questions: 4        # max number of sub-questions to decompose into
 
@@ -74,7 +75,7 @@ self_rag:
   provider: ollama             # ollama | anthropic
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 256
   max_context_chars: 4000      # chars of retrieved context fed to the reflector (must match generator)
 
@@ -111,17 +112,18 @@ entity_extractor:
 # ----------------------------------------------------------------------
 
 graph_extraction:
-  mode: combined                  # combined batches; separate retains legacy per-passage stages
-  max_batch_passages: 8            # original citation passages are never merged
-  max_batch_chars: 6000            # same-source extraction context, not retrieval chunk size
-  max_tokens: 8192                 # bounded combined hierarchy + concept-card output
-  max_workers: 4                   # provider I/O, bounded by LUMINRAG_INGEST_LLM_WORKERS
+  mode: compact                   # integrated topics + concise source-grounded concept cards
+  local_mode: combined             # private Ollama: compact requires an operator-configured large context
+  max_batch_passages: 64           # original citation passages are never merged
+  max_batch_chars: 32000           # same-source extraction context, not retrieval chunk size
+  max_tokens: 8192                 # bounded complete hierarchy; rejects incomplete output
+  max_workers: 8                   # provider I/O, bounded by LUMINRAG_INGEST_LLM_WORKERS
 
 topic_extractor:
   provider: ollama                # ollama | anthropic
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 512
   merge_threshold: 0.85              # cosine cutoff for synonym-swap with existing topic names
 
@@ -129,7 +131,7 @@ subtopic_extractor:
   provider: ollama
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 512
   merge_threshold: 0.82
   max_workers: 4          # parallel LLM calls; set OLLAMA_NUM_PARALLEL to the same value
@@ -138,7 +140,7 @@ content_synthesizer:
   provider: ollama
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 2000
   merge_threshold: 0.88              # cosine cutoff for synonym-swap on content titles
   # max_per_chunk: omitted → dynamic based on chunk length (3/5/7/10). Set an int to override.
@@ -147,7 +149,7 @@ semantic_linker:
   provider: ollama
   ollama_model: qwen2.5:7b
   ollama_base_url: http://localhost:11434
-  anthropic_model: claude-haiku-4-5-20251001
+  anthropic_model: claude-haiku-5-5
   max_tokens: 2048                    # structured decisions include grounding passage IDs
   sim_lo: 0.55                       # related-but-not-duplicate lower bound
   sim_hi: 0.90                       # upper bound (higher = suspected duplicate)

@@ -20,7 +20,12 @@ export const MODEL_PRESETS: Record<LlmProvider, ModelOption[]> = {
     option('deepseek/deepseek-v4-flash', 'DeepSeek: DeepSeek V4 Flash'),
   ],
   openai: [option('gpt-5.4-mini', 'GPT-5.4 Mini'), option('gpt-5.4', 'GPT-5.4')],
-  anthropic: [option('claude-haiku-4-5', 'Claude Haiku 4.5'), option('claude-sonnet-4-6', 'Claude Sonnet 4.6')],
+  anthropic: [
+    option(MODEL_DEFAULTS.anthropic.fastModel, 'Claude Haiku 5.5', true),
+    option(MODEL_DEFAULTS.anthropic.smartModel, 'Claude Sonnet 5.5', true),
+    option('claude-haiku-4-5', 'Claude Haiku 4.5', true),
+    option('claude-sonnet-4-6', 'Claude Sonnet 4.6', true),
+  ],
   ollama_cloud: [
     option(MODEL_DEFAULTS.ollama_cloud.fastModel, 'Gemma 4 31B', true),
     option(MODEL_DEFAULTS.ollama_cloud.smartModel, 'GPT-OSS 120B', false),

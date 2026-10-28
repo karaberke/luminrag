@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from backend.credentials import is_hosted
 
@@ -23,7 +23,7 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_MODELS = {
-    "anthropic": "claude-haiku-4-5-20251001",
+    "anthropic": "claude-haiku-5-5",
     "openrouter": "anthropic/claude-haiku-4.5",
     "openai": "gpt-5.4-mini",
     "ollama_cloud": "gemma4:31b",
@@ -32,7 +32,7 @@ _DEFAULT_MODELS = {
 _KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY"}
 # These model families reject forced tool choice. Native schema output avoids
 # that incompatibility without another provider request or model lookup.
-_NATIVE_ANTHROPIC = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1")
+_NATIVE_ANTHROPIC = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-mythos-5-1")
 
 # Provider SDKs can log request/response bodies and invalid generated content
 # before raising. Callers report sanitized LLMError instead of these bodies.
@@ -178,6 +178,60 @@ def _messages(prompt: str, system: str | None, images: list | None, provider: st
     return messages
 
 
+def _anthropic_output_format(response_model: type[BaseModel]) -> dict:
+    """Build the SDK's native schema, retaining supported top-level string patterns.
+
+    Schemas are application-defined, never supplied by documents or visitors.
+    The SDK still removes unsupported bounds; Pydantic checks them locally.
+    """
+    from anthropic import transform_schema
+    schema = response_model.model_json_schema()
+    patterns = {name: field["pattern"] for name, field in schema.get("properties", {}).items()
+                if field.get("type") == "string" and "pattern" in field}
+    schema = transform_schema(schema)
+    for name, pattern in patterns.items():
+        schema["properties"][name]["pattern"] = pattern
+    return {"type": "json_schema", "schema": schema}
+
+
+def _correction_messages(messages: list[dict], error: ValidationError, key: str) -> list[dict]:
+    """Copy the user turns with bounded feedback that never contains input values.
+
+    Invalid output is not replayed. Pydantic locations, types and messages
+    describe the schema; inputs, contexts and URLs are excluded explicitly.
+    """
+    lines = []
+    for item in error.errors(include_input=False, include_context=False, include_url=False)[:4]:
+        path = ".".join(str(part) for part in item.get("loc", ())) or "(root)"
+        lines.append("- " + "; ".join(str(value)[:200] for value in (path, item.get("type", ""), item.get("msg", ""))))
+    feedback = ("Correction: the previous response failed schema validation. Return the complete JSON object "
+                "again with these errors fixed. Parent indices are zero-based and must refer to items actually "
+                "returned in this response.\n" + "\n".join(lines))
+    feedback = (feedback.replace(key, "[redacted]") if key else feedback)[:1500]
+    corrected = [dict(message) for message in messages]
+    content = corrected[-1]["content"]
+    corrected[-1]["content"] = f"{content}\n\n{feedback}" if isinstance(content, str) else [*content, {"type": "text", "text": feedback}]
+    return corrected
+
+
+def _anthropic_native(client, response_model: type[T], messages: list[dict], retries: int, key: str, **request) -> T:
+    """Reject incomplete output before validation; retry only invalid complete JSON.
+
+    messages.parse validates before stop_reason is checked, so a truncated
+    response could otherwise be retried as if it were a schema failure.
+    """
+    attempt_messages = messages
+    for remaining in range(retries, -1, -1):
+        response = client.messages.create(messages=attempt_messages, **request)
+        text = _validate_completion("".join(part.text for part in response.content if part.type == "text"), response.stop_reason)
+        try:
+            return response_model.model_validate_json(text)
+        except ValidationError as error:
+            if not remaining:
+                raise
+            attempt_messages = _correction_messages(messages, error, key)
+
+
 def complete(prompt: str, cfg: dict, system: str | None = None, images: list | None = None) -> str:
     provider, model, key, tokens, timeout = _settings(cfg)
     try:
@@ -198,7 +252,7 @@ def complete(prompt: str, cfg: dict, system: str | None = None, images: list | N
 
 
 def structured(prompt: str, cfg: dict, response_model: type[T], system: str | None = None, images: list | None = None) -> T:
-    """Validate with Pydantic and retry schema failures through Instructor."""
+    """Validate with Pydantic and retry only bounded schema failures."""
     provider, model, key, tokens, timeout = _settings(cfg)
     try:
         import instructor
@@ -216,9 +270,11 @@ def structured(prompt: str, cfg: dict, response_model: type[T], system: str | No
             if provider == "anthropic":
                 kwargs = {**_anthropic_options(model), **({"system": system} if system else {})}
                 if native or model.startswith(_NATIVE_ANTHROPIC):
-                    response = client.messages.parse(model=model, max_tokens=tokens, messages=messages, output_format=response_model, **kwargs)
-                    _validate_completion("".join(part.text for part in response.content if part.type == "text"), response.stop_reason)
-                    result = response.parsed_output
+                    # Native output has no Instructor; retries apply only to
+                    # local ValidationError of complete output in this call.
+                    kwargs["output_config"] = {**kwargs.get("output_config", {}), "format": _anthropic_output_format(response_model)}
+                    result = _anthropic_native(client, response_model, messages, retries, key,
+                                               model=model, max_tokens=tokens, **kwargs)
                 else:
                     mode = instructor.Mode.JSON if cfg.get("structured_mode") == "json" else instructor.Mode.TOOLS
                     wrapped = instructor.from_anthropic(client, mode=mode)

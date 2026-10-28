@@ -17,6 +17,7 @@ Public API:
     store.save_chunks(chunks)
     store.replace_sources(chunks)   -> list[str] (old chunk ids of replaced sources)
     store.get_chunk(chunk_id)
+    store.get_chunk_sources(chunk_ids) -> dict[str, str] (chunk id -> source id)
     store.get_chunks_by_source(source_id)
     store.get_first_chunk_by_source(source_id)
     store.get_all_chunks()
@@ -244,6 +245,26 @@ class DocumentStore:
                 ).fetchall()
                 rows_by_id.update((row["chunk_id"], row) for row in rows)
         return [_row_to_chunk(rows_by_id[cid]) for cid in ids if cid in rows_by_id]
+
+    def get_chunk_sources(self, chunk_ids: Iterable[str]) -> dict[str, str]:
+        """Map distinct existing chunk IDs to their stored source_id, in request order.
+
+        Reads only the two metadata columns in bounded IN batches, so grouping
+        graph nodes by document never loads passage text. Empty input runs no SQL.
+        """
+        ids = list(dict.fromkeys(chunk_ids))
+        if not ids:
+            return {}
+        sources: dict[str, str] = {}
+        with self._lock:
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(
+                    f"SELECT chunk_id, source_id FROM chunks WHERE chunk_id IN ({placeholders});", batch
+                ).fetchall()
+                sources.update((row["chunk_id"], row["source_id"]) for row in rows)
+        return {cid: sources[cid] for cid in ids if cid in sources}
 
     def get_chunks_by_source(self, source_id: str) -> list[Chunk]:
         """Return all Chunks belonging to source_id, in insertion order."""

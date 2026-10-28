@@ -8,7 +8,7 @@ produce a single calibrated relevance logit, which we map to (0, 1) via
 sigmoid.  Scores are much more meaningful than raw cosine similarity from the
 embedding model.
 
-Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (~22 MB, CPU-friendly).
+Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (~91 MB, CPU-friendly).
 Lazy-loaded on first call and cached for the process lifetime.
 
 Public API:
@@ -24,6 +24,13 @@ import threading
 
 from backend.schemas import Chunk
 from backend.utils.models import pinned_model_path
+from backend.utils.query_intent import multi_document_source_limit
+from backend.utils.resources import (
+    NATIVE_CPU_MEM_ARENA,
+    ModelResourcesBusy,
+    reserve_model_resource,
+    reserve_native_inference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,8 @@ _loaded_model_name: str | None = None
 _inference_lock = threading.RLock()
 
 _DEFAULT_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+# FastEmbed's default of 64 pairs exceeds a 2 GiB container at 512 tokens.
+RERANK_BATCH_SIZE = 8
 
 
 def _get_cross_encoder(model_name: str):
@@ -42,8 +51,11 @@ def _get_cross_encoder(model_name: str):
         from fastembed.rerank.cross_encoder import TextCrossEncoder
         logger.info(f"Loading cross-encoder '{model_name}' …")
         threads = min(8, max(1, int(os.getenv("LUMIN_MODEL_THREADS", "2"))))
-        _cross_encoder = TextCrossEncoder(model_name=model_name, threads=threads,
-                                         specific_model_path=str(pinned_model_path(model_name)))
+        # Callers hold _inference_lock; the shared native gate nests inside it.
+        with reserve_native_inference():
+            _cross_encoder = TextCrossEncoder(model_name=model_name, threads=threads,
+                                             specific_model_path=str(pinned_model_path(model_name)),
+                                             enable_cpu_mem_arena=NATIVE_CPU_MEM_ARENA)
         _loaded_model_name = model_name
         logger.info("Cross-encoder ready.")
     return _cross_encoder
@@ -58,6 +70,24 @@ def _sigmoid(x: float) -> float:
 
 def _cap(items: list, max_sources: int | None) -> list:
     return items if max_sources is None else items[:max(0, max_sources)]
+
+
+def _source_representatives_first(scored: list[tuple[Chunk, float]], source_limit: int) -> list[tuple[Chunk, float]]:
+    """Move the best eligible passage of up to source_limit sources to the front.
+
+    Only reorders already scored and filtered candidates; the rest keep their
+    stable score order, so a later cap keeps every requested document first.
+    """
+    first: list[int] = []
+    seen: set[str] = set()
+    for index, (chunk, _) in enumerate(scored):
+        if len(seen) >= source_limit:
+            break
+        if chunk.source_id not in seen:
+            seen.add(chunk.source_id)
+            first.append(index)
+    chosen = set(first)
+    return [scored[index] for index in first] + [item for index, item in enumerate(scored) if index not in chosen]
 
 
 def _degraded(
@@ -119,11 +149,21 @@ def rerank(
         # Queries now generate independently of the knowledge-state lock.
         # Keep lazy loading and mutable model/tokenizer access serialized
         # without blocking graph reads, edits, or upload publication.
-        with _inference_lock:
+        with reserve_model_resource(_inference_lock):
             ce = _get_cross_encoder(model_name)
-            raw_scores = list(ce.rerank(query, [chunk.text for chunk in chunks]))
-            if len(raw_scores) != len(chunks) or not all(math.isfinite(float(score)) for score in raw_scores):
-                raise ValueError("Reranker returned invalid scores.")
+        texts = [chunk.text for chunk in chunks]
+        raw_scores: list = []
+        # Release both locks between bounded batches so no reservation spans
+        # every candidate; model lock first, shared native gate second.
+        for start in range(0, len(texts), RERANK_BATCH_SIZE):
+            batch = texts[start:start + RERANK_BATCH_SIZE]
+            with reserve_model_resource(_inference_lock), reserve_native_inference():
+                raw_scores.extend(ce.rerank(query, batch, batch_size=RERANK_BATCH_SIZE))
+        if len(raw_scores) != len(chunks) or not all(math.isfinite(float(score)) for score in raw_scores):
+            raise ValueError("Reranker returned invalid scores.")
+    except ModelResourcesBusy:
+        # Contention is retryable; never mistake it for "no relevant passage".
+        raise
     except Exception as exc:
         return _degraded(chunks, exc, min_relevancy, max_sources)
 
@@ -146,6 +186,10 @@ def rerank(
             )
 
     scored.sort(key=lambda x: x[1], reverse=True)
+
+    source_limit = multi_document_source_limit(query)
+    if source_limit:
+        scored = _source_representatives_first(scored, source_limit)
 
     scored = _cap(scored, max_sources)
 

@@ -8,23 +8,59 @@ def graph_passage_batches(chunks: list[Chunk], *, max_chars: int = 6000, max_pas
     """Group bounded same-source views; original retrieval chunks stay untouched."""
     max_chars = min(12000, max(2000, int(max_chars)))
     max_passages = min(8, max(1, int(max_passages)))
+    return _graph_batches(chunks, max_chars, max_passages)
+
+
+def graph_document_batches(chunks: list[Chunk], *, max_chars: int = 32000, max_passages: int = 64) -> list[list[Chunk]]:
+    """Larger document contexts for compact extraction, retaining every source character."""
+    max_chars = min(32000, max(2000, int(max_chars)))
+    max_passages = min(64, max(1, int(max_passages)))
+    return _graph_batches(chunks, max_chars, max_passages, keep_slides=True)
+
+
+def graph_context_views(chunks: list[Chunk]) -> list[list[Chunk]]:
+    """Keep adjacent slide text and notes together only for explicit slide sources.
+
+    These are ephemeral extraction contexts, not replacement retrieval chunks.
+    Unknown page metadata and non-slide document formats remain independent.
+    """
+    views: list[list[Chunk]] = []
+    previous = None
+    for chunk in chunks:
+        slide = chunk.metadata.get("slide_number")
+        filename = str(chunk.metadata.get("original_filename", "")).lower()
+        slide_source = chunk.modality == "slide" or (chunk.modality == "office" and filename.endswith((".pptx", ".potx")))
+        key = (chunk.source_id, slide) if slide_source and type(slide) is int and slide > 0 else None
+        if key is not None and key == previous:
+            views[-1].append(chunk)
+        else:
+            views.append([chunk])
+        previous = key
+    return views
+
+
+def _graph_batches(chunks: list[Chunk], max_chars: int, max_passages: int, *, keep_slides: bool = False) -> list[list[Chunk]]:
     batches: list[list[Chunk]] = []
     current: list[Chunk] = []
     size = 0
-    for chunk in chunks:
-        # Long custom retrieval chunks receive multiple graph views with the
-        # same original ID, so no tail is silently omitted from extraction.
-        views = [chunk] if len(chunk.text) <= max_chars else [
-            chunk.model_copy(update={"text": chunk.text[offset:offset + max_chars]})
-            for offset in range(0, len(chunk.text), max_chars)
-        ]
-        for view in views:
-            if current and (current[0].source_id != view.source_id or len(current) >= max_passages
-                            or size + len(view.text) > max_chars or any(item.id == view.id for item in current)):
+    groups = graph_context_views(chunks) if keep_slides else [[chunk] for chunk in chunks]
+    for group in groups:
+        if len(group) <= max_passages and sum(len(chunk.text) for chunk in group) <= max_chars:
+            units = [group]
+        else:
+            # Oversized contexts receive bounded views with their original IDs;
+            # no source tail is silently omitted or persisted as a new chunk.
+            units = [[chunk.model_copy(update={"text": chunk.text[offset:offset + max_chars]})]
+                     for chunk in group for offset in range(0, max(1, len(chunk.text)), max_chars)]
+        for unit in units:
+            unit_size = sum(len(chunk.text) for chunk in unit)
+            ids = {chunk.id for chunk in unit}
+            if current and (current[0].source_id != unit[0].source_id or len(current) + len(unit) > max_passages
+                            or size + unit_size > max_chars or any(item.id in ids for item in current)):
                 batches.append(current)
                 current, size = [], 0
-            current.append(view)
-            size += len(view.text)
+            current.extend(unit)
+            size += unit_size
     if current:
         batches.append(current)
     return batches

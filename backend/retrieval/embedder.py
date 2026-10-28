@@ -20,10 +20,16 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from backend.utils.resources import ModelResourcesBusy, model_resource_timeout
+from backend.utils.resources import (
+    NATIVE_CPU_MEM_ARENA,
+    ModelResourcesBusy,
+    model_resource_timeout,
+    reserve_native_inference,
+)
 from backend.utils.models import pinned_model_path
 
-EMBEDDING_BATCH_SIZE = 32
+# Small native batches keep peak RSS of 512-token passages within 2 GiB.
+EMBEDDING_BATCH_SIZE = 16
 
 
 class Embedder:
@@ -39,8 +45,10 @@ class Embedder:
             model_name = "sentence-transformers/all-MiniLM-L6-v2"
         self._model_name = model_name
         threads = min(8, max(1, int(os.getenv("LUMIN_MODEL_THREADS", "2"))))
-        self._model = TextEmbedding(model_name=model_name, threads=threads,
-                                    specific_model_path=str(pinned_model_path(model_name)))
+        with reserve_native_inference():
+            self._model = TextEmbedding(model_name=model_name, threads=threads,
+                                        specific_model_path=str(pinned_model_path(model_name)),
+                                        enable_cpu_mem_arena=NATIVE_CPU_MEM_ARENA)
         self._dimension = TextEmbedding.get_embedding_size(model_name)
         # ONNX/tokenizer inference is serialized independently of state locks.
         self._inference_condition = threading.Condition()
@@ -94,7 +102,8 @@ class Embedder:
         for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
             selected = positions[start:start + EMBEDDING_BATCH_SIZE]
             batch = [texts[index] for index in selected]
-            with self._reserve_inference():
+            # Per-model reservation first, then the process-wide native gate.
+            with self._reserve_inference(), reserve_native_inference():
                 result = np.asarray(list(self._model.embed(batch, batch_size=EMBEDDING_BATCH_SIZE)), dtype=np.float32)
             if result.shape != (len(batch), self.dimension):
                 raise ValueError("Embedding model returned an unexpected number of vectors.")
@@ -109,7 +118,7 @@ class Embedder:
 
     def embed_query(self, text: str) -> np.ndarray:
         """Encode a query using BGE's retrieval prefix, not the passage API."""
-        with self._reserve_inference():
+        with self._reserve_inference(), reserve_native_inference():
             vecs = np.asarray(list(self._model.query_embed(text)), dtype=np.float32)
         return self._normalize(vecs)[0]
 

@@ -33,6 +33,7 @@ from backend.db.document_store import DocumentStore
 from backend.graph.graph_builder import GraphBuilder
 from backend.retrieval.embedder import Embedder
 from backend.schemas import Chunk, GraphTriple, RetrievalResult
+from backend.utils.query_intent import multi_document_source_limit
 from backend.utils.resources import reserve_model_resource
 from backend.utils.text import node_text as _node_text
 
@@ -58,6 +59,37 @@ def clear_node_embeddings(graph: nx.MultiDiGraph | None = None) -> None:
             _graph_caches.clear()
         else:
             _graph_caches.pop(graph, None)
+
+
+def copy_node_embeddings(source: nx.MultiDiGraph, target: nx.MultiDiGraph) -> None:
+    """Carry valid vectors into an explicit graph clone without sharing state.
+
+    Node IDs alone never authorize reuse: both graphs must still match the
+    cached text, and subsequent reads continue checking the embedder identity.
+    """
+    # Some callers clone immediately after committing storage. An optional
+    # cache optimization must never introduce a retryable post-commit failure.
+    if not _node_emb_lock.acquire(blocking=False):
+        return
+    try:
+        cache = _graph_caches.get(source)
+        if cache is None:
+            return
+        embedder, vectors, cached_texts = cache
+        copied_vectors, copied_texts = {}, {}
+        for key, vector in vectors.items():
+            if key not in source or key not in target:
+                continue
+            text = cached_texts.get(key)
+            if text != _node_text(source.nodes[key], key) or text != _node_text(target.nodes[key], key):
+                continue
+            copied = vector.copy()
+            copied.flags.writeable = False
+            copied_vectors[key] = copied
+            copied_texts[key] = text
+        _graph_caches[target] = (embedder, copied_vectors, copied_texts)
+    finally:
+        _node_emb_lock.release()
 
 
 _LEAF_RELATIONS = frozenset({"EVIDENCE_OF"})
@@ -214,6 +246,83 @@ def _find_anchors(
     return string_hits + [remaining[i] for i in top_idx]
 
 
+def _node_chunk_ids(graph: nx.MultiDiGraph, node_key: str, limit: int | None = None) -> list[str]:
+    """A node's own evidence chunk IDs (source_ids, then legacy chunk-ref leaves)."""
+    ids: dict[str, None] = {}
+    for chunk_id in graph.nodes[node_key].get("source_ids") or []:
+        if limit is not None and len(ids) >= limit:
+            return list(ids)
+        if isinstance(chunk_id, str):
+            ids[chunk_id] = None
+    for source, _, data in graph.in_edges(node_key, data=True):
+        if limit is not None and len(ids) >= limit:
+            break
+        if data.get("relation") == "EVIDENCE_OF" and graph.nodes[source].get("node_type") == "chunk_ref":
+            ids[source] = None
+    return list(ids)
+
+
+def _find_source_diverse_anchors(
+    query: str,
+    graph: nx.MultiDiGraph,
+    embedder: Embedder,
+    store: DocumentStore,
+    top_k: int,
+    source_limit: int,
+    key_term_boost: float,
+    relevance_threshold: float,
+    query_emb: np.ndarray,
+) -> tuple[list[str], dict[str, str], dict[str, list[str]]]:
+    """Anchors for an explicit multi-document question.
+
+    Topic scoping keeps only the top two topics, which can all belong to one
+    document. Instead rank every graph node above the relevance threshold,
+    take the best node of each distinct stored source (up to source_limit),
+    then fill the remaining top_k slots in score order. Source groups come
+    from the stored Chunk.source_id of every relevant node's full evidence,
+    in one batched metadata lookup; no score shortlist precedes grouping, so
+    many strong nodes of one document cannot hide another's relevant node.
+    Returns (anchors, chunk_id -> source_id, node -> evidence IDs) so
+    retrieval can seed per-source evidence without repeating the lookup.
+    With fewer than two represented sources this falls back to the ordinary
+    anchor search with empty maps.
+    """
+    if top_k <= 0 or graph.number_of_nodes() == 0:
+        return [], {}, {}
+    keys = [k for k, a in graph.nodes(data=True) if a.get("node_type") != "chunk_ref"]
+    if not keys:
+        return [], {}, {}
+    q_lower = query.lower()
+    scores = _embed_keys(keys, graph, embedder) @ query_emb
+    if key_term_boost > 0:
+        scores = scores + np.array(
+            [key_term_boost if _key_term_hit(graph.nodes[k], q_lower) else 0.0 for k in keys],
+            dtype=scores.dtype,
+        )
+    ranked = sorted((-score, key) for score, key in zip(scores.tolist(), keys) if score >= relevance_threshold)
+    ranked_keys = [key for _, key in ranked]
+    node_ids = {key: _node_chunk_ids(graph, key) for key in ranked_keys}
+    chunk_sources = store.get_chunk_sources(dict.fromkeys(cid for key in ranked_keys for cid in node_ids[key]))
+
+    anchors: list[str] = []
+    represented: list[str] = []
+    for key in ranked_keys:
+        if len(anchors) >= top_k or len(represented) >= source_limit:
+            break
+        sources = dict.fromkeys(chunk_sources[cid] for cid in node_ids[key] if cid in chunk_sources)
+        new = [source for source in sources if source not in represented]
+        if new:
+            anchors.append(key)
+            represented.extend(new[:source_limit - len(represented)])
+    if len(represented) < 2:
+        fallback = _find_anchors(query, graph, embedder, top_k, key_term_boost, relevance_threshold,
+                                 query_emb=query_emb)
+        return fallback, {}, {}
+    chosen = set(anchors)
+    anchors.extend([key for key in ranked_keys if key not in chosen][:top_k - len(anchors)])
+    return anchors, chunk_sources, node_ids
+
+
 # ---------------------------------------------------------------------------
 # Relevance-guided BFS
 # ---------------------------------------------------------------------------
@@ -318,7 +427,14 @@ def retrieve_graph(
         return RetrievalResult(chunks=[], subgraph=[], routing_mode="graph")
 
     q_emb = getattr(embedder, "embed_query", embedder.embed_one)(query)
-    anchors = _find_anchors(query, graph, embedder, top_k_anchors, key_term_boost, threshold, query_emb=q_emb)
+    source_limit = multi_document_source_limit(query)
+    chunk_sources: dict[str, str] = {}
+    node_ids: dict[str, list[str]] = {}
+    if source_limit:
+        anchors, chunk_sources, node_ids = _find_source_diverse_anchors(
+            query, graph, embedder, store, top_k_anchors, source_limit, key_term_boost, threshold, q_emb)
+    else:
+        anchors = _find_anchors(query, graph, embedder, top_k_anchors, key_term_boost, threshold, query_emb=q_emb)
     if not anchors:
         logger.warning(f"No anchor nodes found for query: '{query[:60]}'")
         return RetrievalResult(chunks=[], subgraph=[], routing_mode="graph")
@@ -349,6 +465,22 @@ def retrieve_graph(
             if len(all_chunk_ids) >= max_chunks:
                 break
             all_chunk_ids[chunk_id] = None
+
+    if source_limit:
+        # One owned chunk per represented source first, from the stored
+        # metadata: a shared anchor may list many A IDs before its only B ID.
+        seeded: set[str] = set()
+        for node_key in anchors:
+            for chunk_id in node_ids.get(node_key, ()):
+                source = chunk_sources.get(chunk_id)
+                if source is not None and source not in seeded and len(seeded) < source_limit:
+                    seeded.add(source)
+                    add_ids([chunk_id])
+        # Then each anchor's own evidence so many nodes from one document
+        # cannot exhaust max_chunks before another requested source.
+        share = max(1, max_chunks // len(anchors))
+        for node_key in anchors:
+            add_ids(_node_chunk_ids(graph, node_key, share))
 
     # Specific content and relationship evidence should not be crowded out by
     # broad topics whose source_ids may cover the entire corpus.

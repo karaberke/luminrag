@@ -117,8 +117,11 @@ class GraphBuilder:
 
     def clone(self, graph_path: str | Path) -> "GraphBuilder":
         """Independent candidate graph, including nested node/edge attributes."""
+        from backend.retrieval.graph_retriever import copy_node_embeddings
+
         candidate = deepcopy(self)
         candidate._path = Path(graph_path)
+        copy_node_embeddings(self._graph, candidate._graph)
         return candidate
 
     def load(self) -> None:

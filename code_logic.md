@@ -68,6 +68,14 @@ The default Docker Compose stack runs the website, slim hosted backend and a
 dedicated Cloudflare Tunnel connector in one isolated network namespace, without
 host ports. Only the connector receives the tunnel token. The backend has
 bounded CPU, memory, temporary storage, workspace and inference admission limits.
+Embedding uses batches of 16 passages and reranking uses batches of 8 query/passage
+pairs. Both pinned ONNX CPU sessions disable memory arenas, so earlier batch peaks
+are not retained in separate session arenas. Model loading and each native batch
+share FIFO admission; per-model reservations always precede the shared gate and
+are released between batches. Interactive waits remain bounded and contention
+returns a retryable busy response. The default backend limit stays at 2 GiB,
+including documents, temporary files and parsing as well as native models; remote
+AI request concurrency does not increase the number of native model sessions.
 The hosted image is also portable to other supported container hosts. Readiness
 is public and contains no corpus information. ALLOWED_ORIGINS is an exact
 frontend-origin allowlist. Rate/body/file/archive/image/model-admission limits
