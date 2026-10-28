@@ -15,6 +15,15 @@ export function highlightGraphTrace(graph: GraphData, hops: readonly string[], t
   }
 }
 
+/** Keep the current trace across a refresh only while nodes, edges and associations are unchanged. */
+export function retainGraphTrace(previous: GraphData, next: GraphData): GraphData {
+  const hops = previous.nodes.filter((node) => node.highlighted)
+    .sort((a, b) => (a.hopIndex ?? 0) - (b.hopIndex ?? 0)).map((node) => node.id)
+  if (!hops.length && previous.traceId === undefined) return next
+  if (previous.association_version !== next.association_version || graphTopologyKey(previous) !== graphTopologyKey(next)) return next
+  return highlightGraphTrace(next, hops, previous.traceId)
+}
+
 export function graphTraceKey(graph: GraphData): string {
   return graph.traceId ?? graph.nodes.filter((node) => node.highlighted).map((node) => node.id).join('|')
 }

@@ -76,6 +76,8 @@ export interface GraphData {
 /** Inverse operations returned by the backend can include an internal restore payload. */
 export interface GraphOp { op: string; [key: string]: unknown }
 export interface GraphOpsResponse { graph?: GraphData; version: number; inverses?: GraphOp[]; inverse?: GraphOp[] }
+/** `lumin-graph-changed` detail; only a position-only save for the same workspace keeps the active trace. */
+export interface GraphChangedDetail { workspaceId: string; positionOnly: boolean; graph?: GraphData }
 
 export interface EvidenceChunk {
   id: string

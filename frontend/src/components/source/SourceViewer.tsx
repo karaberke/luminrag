@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useId, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useId, useRef, useState } from 'react'
 import type { EvidenceChunk } from '../../types'
 import { originalForEvidence, cachedSourceUrl, type RawFileRecord } from '../../storage/db'
 import { evidenceWithContext, sourceDisplayName, sourceLocation, sourceUrl, validatedEvidenceQuote } from '../../utils/source'
@@ -20,6 +20,11 @@ export default function SourceViewer({ chunk: originalChunk, onClose }: { chunk:
   const filename = sourceDisplayName(chunk)
   const location = sourceLocation(chunk)
   const quote = validatedEvidenceQuote(chunk)
+  // Any change to the citation remounts the PDF view and discards a page it resolved for the previous one.
+  const citationKey = `${JSON.stringify([sourceKey, chunk.id, chunk.page, chunk.page_end, quote, chunk.text])}`
+  const [resolvedCited, setResolvedCited] = useState<{ key: string; page: number }>()
+  const citedPage = resolvedCited?.key === citationKey ? resolvedCited.page : chunk.page
+  const resolveCitedPage = useCallback((page: number) => setResolvedCited({ key: citationKey, page }), [citationKey])
   const extension = (original?.name ?? filename).split('.').at(-1)?.toLowerCase()
   const originalURL = original && (cachedSourceUrl(chunk.source) || cachedSourceUrl(original.name))
 
@@ -43,11 +48,11 @@ export default function SourceViewer({ chunk: originalChunk, onClose }: { chunk:
     <div className="h-full flex flex-col text-[var(--lumin-ink)]">
       <header className="flex items-center justify-between gap-3 px-5 py-3 border-b border-[var(--lumin-border)] shrink-0">
         <div className="min-w-0"><h2 id={titleId} className="font-bold text-base truncate">{filename}</h2><p className="text-xs text-[var(--lumin-muted)]">{location || 'Original source and supporting passage'}</p></div>
-        <div className="flex items-center gap-3 shrink-0">{originalURL && <a className="text-xs underline" href={sourceUrl(original?.name ?? chunk.source, chunk.modality, chunk.page, chunk.timestamp)} target="_blank" rel="noreferrer">Open original ↗</a>}<button type="button" aria-label="Close source viewer" onClick={onClose} className="rounded-lg border border-[var(--lumin-border)] px-2 py-1 text-sm">Close ×</button></div>
+        <div className="flex items-center gap-3 shrink-0">{originalURL && <a className="text-xs underline" href={sourceUrl(original?.name ?? chunk.source, chunk.modality, citedPage, chunk.timestamp)} target="_blank" rel="noreferrer">Open original ↗</a>}<button type="button" aria-label="Close source viewer" onClick={onClose} className="rounded-lg border border-[var(--lumin-border)] px-2 py-1 text-sm">Close ×</button></div>
       </header>
       <div className="min-h-0 flex-1 flex flex-col lg:flex-row overflow-hidden">
         <section aria-label="Original document" className="min-h-0 min-w-0 flex-1 overflow-auto [scrollbar-gutter:stable] bg-[var(--lumin-paper-soft)] p-3">
-          {original === undefined ? <p role="status" className="p-5 text-sm">Opening the original saved on this device…</p> : original && extension === 'pdf' ? <Suspense fallback={<p role="status" className="p-5 text-sm">Loading PDF viewer…</p>}><PdfSourceView key={`${sourceKey}\u0000${chunk.id}`} original={original.blob} chunk={chunk} quote={quote} /></Suspense> : original && extension === 'docx' ? <Suspense fallback={<p role="status" className="p-5 text-sm">Loading Word preview…</p>}><WordSourceView original={original.blob} quote={quote} passage={chunk.text} /></Suspense> : <div className="rounded-xl border border-[var(--lumin-border)] bg-[var(--lumin-paper)] p-5">
+          {original === undefined ? <p role="status" className="p-5 text-sm">Opening the original saved on this device…</p> : original && extension === 'pdf' ? <Suspense fallback={<p role="status" className="p-5 text-sm">Loading PDF viewer…</p>}><PdfSourceView key={citationKey} original={original.blob} chunk={chunk} quote={quote} onResolvedCitedPage={resolveCitedPage} /></Suspense> : original && extension === 'docx' ? <Suspense fallback={<p role="status" className="p-5 text-sm">Loading Word preview…</p>}><WordSourceView original={original.blob} quote={quote} passage={chunk.text} /></Suspense> : <div className="rounded-xl border border-[var(--lumin-border)] bg-[var(--lumin-paper)] p-5">
             <h3 className="text-sm font-bold">{chunk.modality === 'note' ? 'Your note' : chunk.slide_number ? `Extracted text from slide ${chunk.slide_number}` : 'Extracted source passage'}</h3>
             {!original && chunk.modality !== 'note' && <p role="status" className="text-xs text-[var(--lumin-muted)] my-3">The original file is not saved on this device. Import a backup with original files, or upload it again. The cited passage is available below.</p>}
             {original && <p className="text-xs text-[var(--lumin-muted)] my-3">This format is shown as extracted text. Open the original to see its formatting.</p>}

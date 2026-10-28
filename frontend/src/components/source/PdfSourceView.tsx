@@ -37,7 +37,7 @@ function PdfPageSlot({ page, width, current, onSettled }: PageTarget & { current
   </div>
 }
 
-export default function PdfSourceView({ original, chunk, quote }: { original: Blob; chunk: EvidenceChunk; quote: string | null }) {
+export default function PdfSourceView({ original, chunk, quote, onResolvedCitedPage }: { original: Blob; chunk: EvidenceChunk; quote: string | null; onResolvedCitedPage: (page: number) => void }) {
   const passage = chunk.text
   const [data, setData] = useState<{ data: Uint8Array }>()
   const [page, setPage] = useState(Math.max(1, chunk.page ?? 1))
@@ -103,6 +103,8 @@ export default function PdfSourceView({ original, chunk, quote }: { original: Bl
     const end = Math.min(reportedEnd, start + 15)
     let target = start
     let unresolved: string | null = null
+    // Only a unique quote match is reported upward; the start-page fallback is not an exact citation.
+    let exact = false
     try {
       // Search only the backend-reported source span for older bundles without exact quote-page maps.
       if (quote && reportedEnd > start) {
@@ -115,12 +117,14 @@ export default function PdfSourceView({ original, chunk, quote }: { original: Bl
         const resolved = resolveSourceQuotePage(pages, quote, passage)
         if (resolved === null) unresolved = 'The quote could not be uniquely located within the reported source pages. Read the supporting quote beside the original and use the page controls.'
         target = resolved ?? start
+        exact = resolved !== null
       }
     } catch { unresolved = 'The cited page is open. Use the page controls to read the source.' }
     if (!alive.current || !file || opened.current !== file) return
     setLocation(unresolved ? 'ambiguous' : 'ready')
     if (unresolved) setStatus(unresolved)
     setTotal(pdf.numPages); setPage(target); setCitedPage(target)
+    if (exact) onResolvedCitedPage(target)
   }
 
   // Page slots mount only after `loaded`, so these dependencies stay fixed while pages render.

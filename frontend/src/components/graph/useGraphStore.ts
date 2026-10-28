@@ -1,8 +1,8 @@
 import { create } from 'zustand'
 import { temporal } from 'zundo'
-import type { GraphOp, GraphOpsResponse } from '../../types'
+import type { GraphChangedDetail, GraphOp, GraphOpsResponse } from '../../types'
 import { apiJson } from '../../utils/api'
-import { activeWorkspaceId } from '../../storage/db'
+import { activeWorkspaceId, workspaceGeneration } from '../../storage/db'
 
 interface HistoryEntry { forward: GraphOp[]; inverse: GraphOp[] }
 interface GraphEditorState { steps: HistoryEntry[]; busy: boolean; selectedIds: string[]; setSelection: (ids: string[]) => void }
@@ -10,10 +10,18 @@ export const useGraphStore = create<GraphEditorState>()(temporal((set) => ({
   steps: [], busy: false, selectedIds: [], setSelection: (selectedIds) => set({ selectedIds }),
 }), { partialize: ({ steps }) => ({ steps }), equality: (a, b) => a.steps === b.steps, limit: 100 }))
 
-async function submit(ops: GraphOp[]): Promise<GraphOpsResponse> {
+/** Undo/Redo leave `allowPositionOnly` off, so their refresh always clears the trace. */
+async function submit(ops: GraphOp[], allowPositionOnly = false): Promise<GraphOpsResponse> {
   const workspaceId = activeWorkspaceId()
+  const generation = workspaceGeneration(workspaceId)
   const response = await apiJson<GraphOpsResponse>('/api/graph/ops', { method: 'POST', json: { ops }, workspaceId })
-  if (activeWorkspaceId() === workspaceId) window.dispatchEvent(new CustomEvent('lumin-graph-changed', { detail: response.graph }))
+  if (activeWorkspaceId() === workspaceId) {
+    // A save that outlived a clear of its workspace still invalidates.
+    const positionOnly = allowPositionOnly && ops.length > 0 && ops.every((op) => op.op === 'set_positions')
+      && workspaceGeneration(workspaceId) === generation
+    const detail: GraphChangedDetail = { workspaceId, positionOnly, graph: response.graph }
+    window.dispatchEvent(new CustomEvent<GraphChangedDetail>('lumin-graph-changed', { detail }))
+  }
   return response
 }
 
@@ -23,7 +31,7 @@ export async function applyGraphOps(ops: GraphOp[], { recordHistory = true }: { 
   useGraphStore.setState({ busy: true })
   const workspaceId = activeWorkspaceId()
   try {
-    const response = await submit(ops)
+    const response = await submit(ops, true)
     if (recordHistory && workspaceId === activeWorkspaceId()) useGraphStore.setState(({ steps }) => ({ steps: [...steps, { forward: ops, inverse: response.inverses ?? response.inverse ?? [] }] }))
   } finally { useGraphStore.setState({ busy: false }) }
 }

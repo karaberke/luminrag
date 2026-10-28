@@ -1,7 +1,7 @@
 import BrandMark from './components/BrandMark'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { liveQuery } from 'dexie'
-import type { EvidenceChunk, GraphData, GraphNode, Message, NodeType } from './types'
+import type { EvidenceChunk, GraphChangedDetail, GraphData, GraphNode, Message, NodeType } from './types'
 const GraphPanel = lazy(() => import('./components/GraphPanel'))
 const SourceViewer = lazy(() => import('./components/source/SourceViewer'))
 import MessageBubble from './components/MessageBubble'
@@ -22,7 +22,7 @@ import {
   isAuthError,
 } from './utils/api'
 import { endSession, fetchAuthStatus, observeSessionStatus } from './utils/auth'
-import { applyNodeUpdates, evidenceForNode, highlightGraphTrace, type NodeEvidenceState } from './utils/graph'
+import { applyNodeUpdates, evidenceForNode, highlightGraphTrace, retainGraphTrace, type NodeEvidenceState } from './utils/graph'
 import { activeWorkspaceId, clearWorkspaceData, db, pendingIngestJobs, preloadSources, settleIngestOriginals, withOriginalsLock } from './storage/db'
 import { restoreSelectedWorkspace, scheduleWorkspaceSave } from './utils/workspaces'
 import { finishOpenRouterConnection, getLlmSettings, loadLlmSettings } from './utils/settings'
@@ -111,6 +111,7 @@ export default function App() {
   const baseGraphRef = useRef<GraphData>(EMPTY_GRAPH)
   const nodeDetailRef = useRef<HTMLDivElement>(null)
   const graphLoadRef = useRef<AbortController | null>(null)
+  const traceInvalidationPendingRef = useRef(false)
   const suggestionsLoadRef = useRef<AbortController | null>(null)
   const queryAbortRef = useRef<AbortController | null>(null)
   const previousWorkspaceRef = useRef<string | null>(null)
@@ -286,19 +287,25 @@ export default function App() {
   // Graph + suggestions. Each load supersedes (aborts) the previous one so a
   // slow, stale response can never overwrite a newer graph or a clear.
   // ---------------------------------------------------------------------------
-  const loadGraph = useCallback(() => {
+  const loadGraph = useCallback((preserveTrace = false) => {
+    // An invalidating load that was aborted or failed still invalidates whichever load commits next.
+    if (!preserveTrace) traceInvalidationPendingRef.current = true
+    const keepTrace = preserveTrace && !traceInvalidationPendingRef.current
     graphLoadRef.current?.abort()
     const controller = new AbortController()
     graphLoadRef.current = controller
+    const ownerWorkspace = activeWorkspaceId()
     return apiJson<GraphData>('/api/graph', { signal: controller.signal, cache: 'no-store' })
       .then(async (data) => {
         const normalized = await normalizeGraphConnections(data)
-        if (controller.signal.aborted) return
+        if (controller.signal.aborted || activeWorkspaceId() !== ownerWorkspace) return
         const next = normalized.nodes.length > 0 ? unhighlighted(normalized) : EMPTY_GRAPH
         // Old inverse operations can refer to removed parallel edge identities.
         if (baseGraphRef.current.association_version !== next.association_version) resetGraphHistory()
         baseGraphRef.current = next
-        setGraph(next)
+        // Read the trace shown now, never one captured when this request started.
+        setGraph((previous) => keepTrace ? retainGraphTrace(previous, next) : next)
+        traceInvalidationPendingRef.current = false
         setSelectedNodeId((id) => id && next.nodes.some((node) => node.id === id) ? id : null)
         setEvidenceVersion((version) => version + 1)
         return true
@@ -368,7 +375,11 @@ export default function App() {
       setActiveSource(null)
       setWorkspaceId(activeWorkspaceId()); resetGraphHistory()
     }
-    const graphChanged = () => { loadGraph() }
+    const graphChanged = (event: Event) => {
+      // Legacy or malformed details, and other workspaces' saves, clear the trace as before.
+      const detail = (event as CustomEvent<Partial<GraphChangedDetail> | null | undefined>).detail
+      loadGraph(detail?.positionOnly === true && detail.workspaceId === activeWorkspaceId())
+    }
     const assetsChanged = () => setEvidenceVersion((version) => version + 1)
     window.addEventListener('lumin-workspace-changed', change)
     window.addEventListener('lumin-workspace-changing', changing)

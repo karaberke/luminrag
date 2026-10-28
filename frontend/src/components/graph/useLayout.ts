@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useSigma } from '@react-sigma/core'
 import ForceAtlas2Worker from 'graphology-layout-forceatlas2/worker'
 import { applyGraphOps } from './useGraphStore'
@@ -7,8 +7,11 @@ import { graphLayoutSettings, separateGraphNodes } from '../../utils/graphLayout
 
 export function useLayout(layoutKey: string, spacing: number, shouldLayout: boolean): void {
   const sigma = useSigma()
+  // Reactivation must not repeat a placement that already completed; an interrupted one resumes.
+  const completedRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!shouldLayout || !sigma.getGraph().order) return
+    const request = JSON.stringify([layoutKey, spacing])
+    if (!shouldLayout || completedRef.current === request || !sigma.getGraph().order) return
     const graph = sigma.getGraph()
     const layout = new ForceAtlas2Worker(graph, { settings: graphLayoutSettings(spacing) })
     layout.start()
@@ -17,6 +20,7 @@ export function useLayout(layoutKey: string, spacing: number, shouldLayout: bool
       if (!fitGraphBounds(sigma, { animate: false })) return
       separateGraphNodes(sigma, spacing)
       fitGraphBounds(sigma, { animate: false, preserveScale: true })
+      completedRef.current = request
       const positions = graph.mapNodes((id, attrs) => ({ id, x: attrs.x, y: attrs.y }))
       // Automatic placement is persisted without displacing the user's semantic edit or redo history.
       applyGraphOps([{ op: 'set_positions', positions }], { recordHistory: false }).catch(() => {})
