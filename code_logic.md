@@ -14,11 +14,20 @@ A single fetch helper (`frontend/src/utils/api.ts`) supplies workspace and reque
 
 Fast models handle extraction, routing, captioning, decomposition, reflection. Smart models compose answers. Fast query mode skips question decomposition and reflection gates; Thorough retains the full verification pipeline. Retrieval uses FastEmbed BAAI/bge-small-en-v1.5 passages/query encoding, NumPy exact cosine top-k, and Xenova/ms-marco-MiniLM-L-6-v2 ONNX reranking.
 
-Direct OpenAI, Anthropic and OpenRouter use fixed official endpoints; native
+Direct OpenAI, Anthropic, OpenRouter and Ollama Cloud use fixed official endpoints; native
 OpenAI uses strict structured output and completion-token budgets. Model
 preferences persist, while all customer keys stay in memory. Skipped and
 unavailable verification have explicit states and neutral UI; Thorough mode
 withholds an answer when its source-support check fails.
+
+Ollama Cloud has the distinct `ollama_cloud` provider identifier. It reuses the
+OpenAI SDK at `https://ollama.com/v1` with request-scoped keys, `max_tokens` and
+`reasoning_effort: none`. Cloud structured calls always use prompt JSON plus
+Pydantic validation, preserving bounded retries and source checks without
+requiring native schema/tool support. It has no environment-key fallback or
+user-configurable endpoint. The existing local `ollama` provider remains private
+self-hosted only. Curated Cloud presets carry known vision capabilities; model
+IDs remain editable without adding a browser-side Cloud API connection.
 
 Final answer generation returns Markdown and numbered supporting quotes in one structured provider call. Quote spans must match the actual numbered context passage and a citation used in the answer. Unverifiable quotes are discarded. Evidence responses retain complete passages, original filenames, sections, PDF page ranges and slide numbers. The browser lazily opens original-document previews, selects the cited PDF page or matching Word paragraph, and highlights validated supporting text. Missing originals and unmatched text retain a readable extracted-passage fallback. Word preview pages honor explicit breaks but do not promise Microsoft Word's pagination.
 

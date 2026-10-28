@@ -7,7 +7,10 @@ export interface ModelOption {
   supported_parameters?: string[]
 }
 
-const option = (id: string, name: string): ModelOption => ({ id, name })
+const option = (id: string, name: string, vision?: boolean): ModelOption => ({
+  id, name,
+  ...(vision === undefined ? {} : { architecture: { input_modalities: vision ? ['text', 'image'] : ['text'], output_modalities: ['text'] } }),
+})
 export const MODEL_PRESETS: Record<LlmProvider, ModelOption[]> = {
   openrouter: [
     option(MODEL_DEFAULTS.openrouter.fastModel, 'Anthropic: Claude Haiku 4.5'),
@@ -18,6 +21,14 @@ export const MODEL_PRESETS: Record<LlmProvider, ModelOption[]> = {
   ],
   openai: [option('gpt-5.4-mini', 'GPT-5.4 Mini'), option('gpt-5.4', 'GPT-5.4')],
   anthropic: [option('claude-haiku-4-5', 'Claude Haiku 4.5'), option('claude-sonnet-4-6', 'Claude Sonnet 4.6')],
+  ollama_cloud: [
+    option(MODEL_DEFAULTS.ollama_cloud.fastModel, 'Gemma 4 31B', true),
+    option(MODEL_DEFAULTS.ollama_cloud.smartModel, 'GPT-OSS 120B', false),
+    option('gpt-oss:20b', 'GPT-OSS 20B', false),
+    option('deepseek-v4.1-flash:1017', 'DeepSeek V4.1 Flash', true),
+    option('mistral-large-4', 'Mistral Large 4', true),
+    option('minimax-m3.1-flash', 'MiniMax M3.1 Flash', true),
+  ],
   ollama: [option('llama3.2', 'Llama 3.2')],
 }
 

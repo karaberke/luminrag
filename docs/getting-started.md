@@ -53,7 +53,7 @@ After installing dependencies, Windows users can start both services with one co
 
 Use `-SelfHosted` for persistent local mode, or `-BackendPort 8010 -FrontendPort 5174` if the default ports are busy. Ctrl+C stops the services started by the script.
 
-For a persistent self-hosted server, omit LUMIN_HOSTED. Local loopback access is allowed; remote access requires LUMINRAG_API_TOKEN. The backend can use .env and config/llm.yaml, or credentials supplied through the UI. Ollama is available only in self-hosted mode. The local .env is ignored by Git and Docker.
+For a persistent self-hosted server, omit LUMIN_HOSTED. Local loopback access is allowed; remote access requires LUMINRAG_API_TOKEN. The backend can use .env and config/llm.yaml, or credentials supplied through the UI. Local Ollama is available only in private self-hosted mode. Ollama Cloud is available in both modes using a visitor's key in AI settings; it needs no local installation or additional server configuration. The local .env is ignored by Git and Docker.
 
 ### Self-hosted Docker with audio/video
 

@@ -45,6 +45,18 @@ and lazy graph enrichment are future architecture work.
 
 Hosted requests carry `X-Workspace-Id` (canonical random UUID4). Provider operations additionally use `X-LLM-Provider`, `X-LLM-Key`, `X-LLM-Model-Fast` and `X-LLM-Model-Smart`. The UUID is a secret capability, so keep it out of URLs and logs. There is no application login in v1.
 
+`X-LLM-Provider: ollama_cloud` selects Ollama Cloud with the same request-scoped
+key and model headers. Its endpoint is fixed to `https://ollama.com/v1`; local
+`ollama` remains self-hosted only. Cloud uses `max_tokens` and requests
+`reasoning_effort: none`, which model-specific controls may interpret differently.
+All Cloud structured requests use prompt JSON followed by Pydantic validation,
+including when configuration previously selected a native-schema mode. No native
+`response_format` or tool requirements are sent. Cloud HTTP requests cannot
+inherit environment or server-configuration keys when request credentials are
+absent, and no shared Cloud key belongs in the deployment environment.
+See [Ollama's compatibility documentation](https://docs.ollama.com/api/openai-compatibility)
+and [Cloud structured-output limitation](https://docs.ollama.com/capabilities/structured-outputs).
+
 - `GET /api/health`, `GET /api/ready`: public capabilities/readiness.
 - `GET /api/workspace/status`: `{loaded,version}`.
 - `POST /api/workspace/import`: multipart `.lumin` file, or `empty=true` to initialize.

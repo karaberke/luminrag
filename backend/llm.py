@@ -7,6 +7,7 @@ must be explicit and their remote endpoints cannot be overridden by callers.
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -19,17 +20,27 @@ from backend.credentials import is_hosted
 T = TypeVar("T", bound=BaseModel)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
+OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_MODELS = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openrouter": "anthropic/claude-haiku-4.5",
     "openai": "gpt-5.4-mini",
+    "ollama_cloud": "gemma4:31b",
     "ollama": "qwen2.5:7b",
 }
 _KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY"}
 # These model families reject forced tool choice. Native schema output avoids
 # that incompatibility without another provider request or model lookup.
 _NATIVE_ANTHROPIC = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-mythos-5-1")
+
+# Provider SDKs can log request/response bodies and invalid generated content
+# before raising. Callers report sanitized LLMError instead of these bodies.
+for _name in ("instructor", "openai", "anthropic"):
+    _provider_logger = logging.getLogger(_name)
+    _provider_logger.addHandler(logging.NullHandler())
+    _provider_logger.setLevel(logging.CRITICAL + 1)
+    _provider_logger.propagate = False
 
 
 class LLMError(RuntimeError):
@@ -70,15 +81,22 @@ def _image_parts(images: list | None, provider: str) -> list[dict]:
 def _client(provider: str, key: str, cfg: dict, timeout: float):
     retries = min(2, max(0, int(cfg.get("sdk_retries", 2))))
     if provider == "anthropic":
-        from anthropic import Anthropic
-        return Anthropic(api_key=key, base_url=ANTHROPIC_BASE_URL, timeout=timeout, max_retries=retries)
-    from openai import OpenAI
-    base_url = OPENAI_BASE_URL if provider == "openai" else OPENROUTER_BASE_URL
+        from anthropic import Anthropic, DefaultHttpxClient
+        logging.getLogger("anthropic").setLevel(logging.CRITICAL + 1)
+        return Anthropic(api_key=key, base_url=ANTHROPIC_BASE_URL, timeout=timeout, max_retries=retries,
+                         http_client=DefaultHttpxClient(follow_redirects=False))
+    from openai import DefaultHttpxClient, OpenAI
+    logging.getLogger("openai").setLevel(logging.CRITICAL + 1)
+    base_url = {
+        "openai": OPENAI_BASE_URL, "ollama_cloud": OLLAMA_CLOUD_BASE_URL,
+    }.get(provider, OPENROUTER_BASE_URL)
     if provider == "ollama":
         base_url = str(cfg.get("ollama_base_url", cfg.get("llm_ollama_base_url", "http://localhost:11434"))).rstrip("/")
         if not base_url.endswith("/v1"):
             base_url += "/v1"
-    return OpenAI(api_key=key, base_url=base_url, timeout=timeout, max_retries=retries)
+    # Even a redirect must not replay a visitor's source context to a new host.
+    options = {"http_client": DefaultHttpxClient(follow_redirects=False)} if provider != "ollama" else {}
+    return OpenAI(api_key=key, base_url=base_url, timeout=timeout, max_retries=retries, **options)
 
 
 def _anthropic_options(model: str) -> dict:
@@ -97,7 +115,48 @@ def _completion_options(provider: str, tokens: int) -> dict:
     # overrides so reasoning models can use the same text and vision transport.
     if provider == "openai":
         return {"max_completion_tokens": tokens, "store": False}
+    if provider == "ollama_cloud":
+        return {"max_tokens": tokens, "reasoning_effort": "none"}
     return {"max_tokens": tokens}
+
+
+def _provider_error(provider: str, error: Exception, *, structured_output: bool = False) -> LLMError:
+    """Classify only trusted exception types; never expose vendor text or bodies."""
+    if provider == "ollama_cloud":
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+        from instructor.core.exceptions import IncompleteOutputException
+
+        current: BaseException | None = error
+        seen: set[int] = set()
+        for _ in range(8):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            if isinstance(current, APITimeoutError):
+                return LLMError("Ollama Cloud timed out. Please retry later.")
+            if isinstance(current, APIStatusError):
+                if 300 <= current.status_code < 400:
+                    return LLMError("Ollama Cloud returned an unexpected redirect. Please retry later.")
+                if current.status_code in {401, 403}:
+                    return LLMError("Ollama Cloud authentication failed. Check your API key and account access.")
+                if current.status_code == 404:
+                    return LLMError("The selected Ollama Cloud model is unavailable. Choose an available Cloud API model ID.")
+                if current.status_code == 429:
+                    return LLMError("Ollama Cloud usage or rate limit reached. Check your account allowance and retry later.")
+                if current.status_code >= 500:
+                    return LLMError("Ollama Cloud is temporarily unavailable. Please retry later.")
+                return LLMError("Ollama Cloud rejected the request. Check model support and token limits.")
+            if isinstance(current, APIConnectionError):
+                return LLMError("Could not connect to Ollama Cloud. Please retry later.")
+            if isinstance(current, IncompleteOutputException):
+                return LLMError("The model reached its token limit. Choose a lighter model or increase its token budget.")
+            current = current.__cause__ or current.__context__
+        if structured_output:
+            return LLMError("Ollama Cloud did not return valid structured output. Please retry or choose a different model.")
+        return LLMError("Ollama Cloud request failed. Check your key, model and account allowance.")
+    if structured_output:
+        return LLMError(f"{provider} did not return valid structured output; please retry.")
+    return LLMError(f"{provider} request failed; check your key, model and spending limit.")
 
 
 def _validate_completion(text: str | None, stop_reason: str | None, refusal: str | None = None) -> str:
@@ -133,9 +192,9 @@ def complete(prompt: str, cfg: dict, system: str | None = None, images: list | N
             return _validate_completion(response.choices[0].message.content, response.choices[0].finish_reason, response.choices[0].message.refusal)
     except LLMError:
         raise
-    except Exception:
+    except Exception as exc:
         # SDK exceptions can contain request bodies, including credentials.
-        raise LLMError(f"{provider} request failed; check your key, model and spending limit.") from None
+        raise _provider_error(provider, exc) from None
 
 
 def structured(prompt: str, cfg: dict, response_model: type[T], system: str | None = None, images: list | None = None) -> T:
@@ -148,7 +207,11 @@ def structured(prompt: str, cfg: dict, response_model: type[T], system: str | No
         with _client(provider, key, {**cfg, "sdk_retries": 0}, timeout) as client:
             messages = _messages(prompt, system, images, provider)
             retries = min(2, max(0, int(cfg.get("structured_retries", 1))))
-            mode_name = cfg.get("structured_mode") or ("native" if provider == "openai" else None)
+            # Cloud has no native structured-output support. Configuration left
+            # over from another provider must never forward schemas or tools.
+            mode_name = "md_json" if provider == "ollama_cloud" else (
+                cfg.get("structured_mode") or ("native" if provider == "openai" else None)
+            )
             native = mode_name in {"native", "json_schema"}
             if provider == "anthropic":
                 kwargs = {**_anthropic_options(model), **({"system": system} if system else {})}
@@ -178,5 +241,5 @@ def structured(prompt: str, cfg: dict, response_model: type[T], system: str | No
             return response_model.model_validate(result.model_dump())
     except LLMError:
         raise
-    except Exception:
-        raise LLMError(f"{provider} did not return valid structured output; please retry.") from None
+    except Exception as exc:
+        raise _provider_error(provider, exc, structured_output=True) from None

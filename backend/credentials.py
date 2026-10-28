@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from backend.utils.environment import hosted_mode
 
-Provider = Literal["anthropic", "openrouter", "openai", "ollama"]
+Provider = Literal["anthropic", "openrouter", "openai", "ollama_cloud", "ollama"]
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
 _FAST_SECTIONS = (
     "captioning", "topic_extractor", "subtopic_extractor", "content_synthesizer",
@@ -41,8 +41,8 @@ def get_credentials(request: Request) -> LLMCredentials | None:
     if not any(values) and not is_hosted():
         return None
     provider, key, fast, smart = values
-    if provider not in ("anthropic", "openrouter", "openai", "ollama") or (is_hosted() and provider == "ollama"):
-        raise HTTPException(401, "Connect OpenAI, OpenRouter or Anthropic in Settings.")
+    if provider not in ("anthropic", "openrouter", "openai", "ollama_cloud", "ollama") or (is_hosted() and provider == "ollama"):
+        raise HTTPException(401, "Connect OpenAI, OpenRouter, Anthropic or Ollama Cloud in Settings.")
     if provider != "ollama" and (not key or len(key) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in key)):
         raise HTTPException(401, "A valid provider key is required.")
     if not _MODEL.fullmatch(fast) or not _MODEL.fullmatch(smart):
@@ -53,18 +53,23 @@ def get_credentials(request: Request) -> LLMCredentials | None:
 def apply_credentials(config: dict, creds: LLMCredentials | None) -> dict:
     """Detach config before passing it across worker threads and executors."""
     result = deepcopy(config)
+    hosted = is_hosted()
     if creds is None:
-        if is_hosted():
-            # A config created without credentials must never inherit local keys.
-            for section in _FAST_SECTIONS + _SMART_SECTIONS:
-                current = result.setdefault(section, {})
+        for section in _FAST_SECTIONS + _SMART_SECTIONS:
+            current = result.setdefault(section, {}) if hosted else result.get(section, {})
+            if not hosted and not isinstance(current, dict):
+                continue  # Preserve unused nullable sections in private configs.
+            # Cloud always uses the visitor's request key, including on private
+            # deployments. Other private providers retain their local settings.
+            if hosted or current.get("provider", current.get("llm_provider")) == "ollama_cloud":
                 current.pop("api_key", None)
+            if hosted:
                 current["hosted"] = True
         return result
     for section in _FAST_SECTIONS + _SMART_SECTIONS:
         current = result.setdefault(section, {})
         model = creds.model_smart if section in _SMART_SECTIONS else creds.model_fast
-        current.update(provider=creds.provider, api_key=creds.api_key.get_secret_value(), model=model, hosted=is_hosted())
+        current.update(provider=creds.provider, api_key=creds.api_key.get_secret_value(), model=model, hosted=hosted)
         # Config from old self-host releases uses provider-specific names.
         current[f"{creds.provider}_model"] = model
         if section == "query_router":

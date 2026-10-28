@@ -58,7 +58,7 @@ sudo docker compose up -d --build --wait --wait-timeout 300
 sudo docker compose ps
 ```
 
-Open your HTTPS hostname and connect OpenAI, Anthropic or OpenRouter in **AI settings**.
+Open your HTTPS hostname and connect OpenAI, Anthropic, OpenRouter or Ollama Cloud in **AI settings**.
 Each visitor supplies their own provider key; no shared AI key belongs in the
 server `.env`. Provider keys are held in the current tab's memory and temporarily
 in server memory during processing; they are never written to browser storage,
@@ -155,9 +155,17 @@ separately from ChatGPT subscriptions. OpenRouter uses the
 already implemented in LuminRAG; no shared developer client secret is needed.
 Provider keys remain in memory during use and are not saved by LuminRAG.
 
+For Ollama Cloud, follow [Ollama's Cloud guide](https://docs.ollama.com/cloud)
+to create an API key, then select **Ollama Cloud** and enter it in AI settings.
+Each visitor uses their own account allowance. No Ollama installation, model
+download, extra container, open port or additional server environment value is
+required. Keep customer keys out of the server `.env`. The app uses the fixed
+Ollama Cloud endpoint; visitors cannot supply an arbitrary server address.
+This Cloud option is separate from local Ollama in the private profile below.
+
 ## Persistent self-hosted alternative
 
-For Ollama, optional audio/video or persistent server-side storage, use the
+For local Ollama, optional audio/video or persistent server-side storage, use the
 separate older profile and template:
 
 ```bash
