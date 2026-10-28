@@ -1,7 +1,7 @@
 import { zipSync, strFromU8, strToU8 } from 'fflate'
 import { readBoundedArchive, type ArchiveLimits } from './archive'
 import { activeWorkspaceId, cacheAsset, cachePassages, createWorkspace, db, hasPendingOriginals, initializeStorage, preloadSources, selectWorkspace, withOriginalsLock, workspaceGeneration } from '../storage/db'
-import { apiJson, apiRequest, registerHydrator } from './api'
+import { ApiError, apiJson, apiRequest, registerHydrator } from './api'
 
 const hydration = new Map<string, Promise<void>>()
 const saves = new Map<string, ReturnType<typeof setTimeout>>()
@@ -116,6 +116,47 @@ async function writeWorkspaceSnapshot(id: string, generation: number, resetFromV
   if (!written) return
   cacheBundleAssets(entries, id)
   window.dispatchEvent(new Event('lumin-workspaces-updated'))
+}
+
+const MISSING_SERVER_CACHE = 'Restore this knowledge base from your browser.'
+const isPlainObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype
+
+/**
+ * Save before an explicit switch. If the server evicted this workspace's
+ * temporary cache, leaving it is still safe when its browser backup is intact:
+ * verify that backup read-only and never import, hydrate or rewrite it here.
+ */
+export async function prepareWorkspaceSwitch(id = activeWorkspaceId()): Promise<void> {
+  const generation = workspaceGeneration(id)
+  const durableGeneration = (await db.workspaces.get(id))?.generation ?? 0
+  try {
+    await saveWorkspaceBundle(id)
+    return
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 409 || error.detail !== MISSING_SERVER_CACHE) throw error
+    const status = await apiJson<{ loaded?: unknown }>('/api/workspace/status', { workspaceId: id, skipHydrate: true, cache: 'no-store' })
+    if (!isPlainObject(status) || status.loaded !== false) throw error
+  }
+  const invalid = new Error('The saved browser copy could not be verified. Switching was stopped to protect your saved data.')
+  // Any local or cross-tab clear since the baseline must stay cleared.
+  const unchanged = async () => {
+    const record = await db.workspaces.get(id)
+    return record && id === activeWorkspaceId() && generation === workspaceGeneration(id) && (record.generation ?? 0) === durableGeneration ? record : undefined
+  }
+  const record = await unchanged()
+  if (!record?.bundle) throw invalid
+  let manifest: unknown, graph: unknown
+  try {
+    const entries = await unpackBundle(record.bundle)
+    if (!entries['manifest.json'] || !entries['chunks.jsonl'] || !entries['graph.json']) throw invalid
+    manifest = JSON.parse(strFromU8(entries['manifest.json']))
+    graph = JSON.parse(strFromU8(entries['graph.json']))
+  } catch { throw invalid }
+  // Missing format fields match the backend's legacy defaults.
+  if (!isPlainObject(manifest) || (manifest.format !== undefined && manifest.format !== 'lumin') || (manifest.version !== undefined && manifest.version !== 1)) throw invalid
+  if (!isPlainObject(graph) || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges === undefined ? graph.links : graph.edges)) throw invalid
+  const latest = await unchanged()
+  if (!latest?.bundle || latest.bundle.size !== record.bundle.size || latest.version !== record.version || latest.updatedAt !== record.updatedAt) throw invalid
 }
 
 export function scheduleWorkspaceSave(id = activeWorkspaceId()): void {

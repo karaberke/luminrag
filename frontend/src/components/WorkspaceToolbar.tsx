@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { activeWorkspaceId, createWorkspace, db, hasPersistentStorage, requestPersistentStorage, selectWorkspace, type WorkspaceRecord } from '../storage/db'
-import { exportWorkspace, importWorkspace, saveWorkspaceBundle } from '../utils/workspaces'
+import { exportWorkspace, importWorkspace, prepareWorkspaceSwitch } from '../utils/workspaces'
 import { errorMessage } from '../utils/api'
 
 export default function WorkspaceToolbar({ onSettings, disabled = false }: { onSettings: () => void; disabled?: boolean }) {
@@ -24,7 +24,7 @@ export default function WorkspaceToolbar({ onSettings, disabled = false }: { onS
     setBusy(true); setError(null)
     const previousId = activeWorkspaceId()
     if (switching) window.dispatchEvent(new Event('lumin-workspace-changing'))
-    try { if (switching) await saveWorkspaceBundle(previousId); await operation() } catch (cause) { setError(errorMessage(cause)) }
+    try { if (switching) await prepareWorkspaceSwitch(previousId); await operation() } catch (cause) { setError(errorMessage(cause)) }
     finally { setBusy(false); if (switching && previousId === activeWorkspaceId()) window.dispatchEvent(new Event('lumin-workspace-transition-ended')) }
   }
   const button = 'text-xs px-2 py-1.5 rounded-lg border border-slate-500/30 hover:border-indigo-500 disabled:opacity-40'
